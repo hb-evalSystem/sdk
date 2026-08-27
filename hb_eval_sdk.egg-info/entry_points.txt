@@ -1,0 +1,3 @@
+[console_scripts]
+hb-eval = hb_eval_sdk.demo:main
+hbeval-mcp = hb_eval_sdk.mcp_server:main
