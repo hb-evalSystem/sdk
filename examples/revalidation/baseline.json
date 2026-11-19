@@ -1,0 +1,27 @@
+{
+  "components": {
+    "payments": "v1",
+    "shipping": "v1",
+    "retry": "v1"
+  },
+  "actions": {
+    "refund": {
+      "complete": true,
+      "dependencies": [
+        "payments",
+        "retry"
+      ],
+      "test": "refund_lost_response@1",
+      "passed_test": "refund_lost_response@1"
+    },
+    "shipment_status": {
+      "complete": true,
+      "dependencies": [
+        "shipping",
+        "retry"
+      ],
+      "test": "shipment_read@1",
+      "passed_test": "shipment_read@1"
+    }
+  }
+}
