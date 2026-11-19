@@ -123,7 +123,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 
 # Default metric floors. These mirror the thresholds used elsewhere in
@@ -180,6 +180,9 @@ class StepRecord:
     metadata: dict = field(default_factory=dict)
 
 
+from .evidence_package import MetricRef, RefType, ProvenanceStatus
+
+
 class MonitorSession:
     """A live monitoring session over a single agent run.
 
@@ -204,7 +207,49 @@ class MonitorSession:
         batch_size: int = DEFAULT_BATCH_SIZE,
         flush_interval: float = DEFAULT_FLUSH_INTERVAL,
         session_metadata: Optional[dict] = None,
+        configuration: Optional[Any] = None,
+        evaluation: Optional[Any] = None,
+        execution_binding: Optional[Any] = None,
     ) -> None:
+        # PHASE 5A — evidence envelope production.
+        #
+        # Both OPTIONAL, deliberately. Making identity mandatory would break
+        # every existing caller, and a session without it behaves exactly as
+        # before with `envelope` left as None — which is truthful rather than
+        # degraded: no envelope can be produced for a run whose configuration
+        # is unknown, and inventing a placeholder identity would be worse than
+        # producing nothing.
+        self._configuration = configuration
+        self._evaluation = evaluation
+        self.envelope = None
+        self.envelope_error: Optional[str] = None
+
+        # PHASE 5C — execution binding and per-metric provenance.
+        #
+        # INV-5C-1  a session carries at most ONE binding
+        # INV-5C-2  binding is attached at session creation, before any step.
+        #           If absent at creation, steps may still be recorded and the
+        #           session is permanently UNAVAILABLE — a later binding is
+        #           refused, because binding after steps exist would
+        #           retroactively attribute those steps to an execution that
+        #           did not exist when they occurred.
+        self._execution_binding = execution_binding
+        self._binding_locked = False
+
+        # Ref tracking, ADDED BESIDE the counters and never replacing them.
+        # The counters remain the source of every metric value; these lists
+        # only record which entity produced each increment. A set replacing a
+        # counter would make provenance capable of changing a value, which is
+        # the one thing 5C must not do.
+        self._all_step_refs: list = []
+        self._traceable_step_refs: list = []
+        self._faulted_step_refs: list = []
+        self._faulted_survived_refs: list = []
+        self._episode_refs: list = []
+        self._plan_transition_refs: list = []
+        self._judged_episode_refs: list = []
+        self._deliberate_episode_refs: list = []
+
         self._client = client
         self.agent_id = agent_id
         self.session_id = str(uuid.uuid4())
@@ -320,6 +365,37 @@ class MonitorSession:
         if metric not in ("pei", "frr", "irs", "ti", "csi"):
             raise ValueError("halt_policy['metric'] must be one of "
                              "pei, frr, irs, ti, csi.")
+
+        # SAFETY ELIGIBILITY — audit finding, reproduced in the Phase 0
+        # baseline.
+        #
+        # This check previously validated the NAME alone, and 'csi' was in the
+        # accepted tuple while CSI is set to None unconditionally in a live
+        # session. A halt policy on CSI was therefore accepted without
+        # complaint and could never fire.
+        #
+        # That is worse than raising: the user configures a guard, receives no
+        # error, believes the agent is protected, and stops looking. A silent
+        # null at least leaves a visible gap.
+        #
+        # Eligibility now comes from the metric's contract rather than a
+        # hardcoded list, so a metric that cannot be computed in this mode
+        # cannot gate a safety decision no matter what it is called.
+        try:
+            from .contracts import CONTRACTS, ineligibility_reason
+        except ImportError:            # pragma: no cover
+            CONTRACTS = None  # type: ignore[assignment]
+        if CONTRACTS is not None:
+            contract = CONTRACTS.get(metric)
+            if contract is not None and not contract.safety_eligible:
+                raise ValueError(
+                    f"halt_policy['metric'] = '{metric}' is not eligible for "
+                    f"safety decisions in a live session. "
+                    f"{contract.safety_note} "
+                    f"A policy that is accepted but can never fire grants a "
+                    f"false sense of protection, so it is refused here "
+                    f"instead."
+                )
 
         if "below" not in policy:
             raise ValueError("halt_policy requires 'below' — the value the "
@@ -449,7 +525,7 @@ class MonitorSession:
             self._enqueue({"type": "snapshot", "payload": self._progress_payload("active")})
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb) -> "Literal[False]":
         self.ended_at = time.time()
 
         if self._stream:
@@ -467,9 +543,247 @@ class MonitorSession:
                 self._flush_summary()
             except Exception:
                 pass
+
+        # PHASE 5A — evidence envelope production.
+        #
+        # LAST, deliberately. The stream drain and the summary flush were here
+        # first and callers depend on them; envelope production must not delay
+        # either, and a failure in it must not prevent them.
+        #
+        # Wrapped in the same try/except discipline as _flush_summary, and for
+        # the same reason made explicit: an envelope is evidence ABOUT a run,
+        # not part of it. If producing it raised and that escaped, HB-Eval
+        # would have broken the agent it was measuring - the failure mode this
+        # project exists to detect in others.
+        try:
+            self._produce_envelope(exc_type, exc)
+        except Exception as env_exc:            # pragma: no cover - belt
+            # Even the failure path is defended. If _produce_envelope's own
+            # error handling failed, the envelope is None and the reason is
+            # recorded, and nothing reaches the caller.
+            self.envelope = None
+            self.envelope_error = f"{type(env_exc).__name__}: {env_exc}"
+
         return False   # never suppress the user's exceptions
 
-    # ── Recording ───────────────────────────────────────────────────────────
+    # ── Evidence envelope (Phase 5A) ────────────────────────────────────────
+
+    def _produce_envelope(self, exc_type=None, exc=None) -> None:
+        """Assemble, seal and verify an EvidenceEnvelope for this run.
+
+        Sets `self.envelope` and `self.envelope_error`. Never raises.
+
+        FOUR OUTCOMES, AND TWO OF THEM MUST NOT BE CONFUSED:
+
+            success    envelope sealed, state COMPLETE
+            partial    envelope sealed, state PARTIAL
+                       -> valid evidence, NOT eligible as a baseline
+            failure    envelope is None, envelope_error set
+            no identity  envelope is None, envelope_error None
+
+        `partial` and `failure` are different facts. "We recorded a run but
+        could not trace its metrics" is actionable - the caller can supply
+        provenance. "We could not record the run" is a different problem with
+        a different fix. Representing both as a missing envelope would lose
+        the distinction, and representing both as a present-but-flawed one
+        would let a failed run look like a measured one.
+        """
+        self.envelope = None
+        self.envelope_error = None
+
+        if self._configuration is None or self._evaluation is None:
+            # Not an error. A run whose configuration is unknown cannot be
+            # given a truthful envelope, and inventing a placeholder identity
+            # would make it comparable to things it is not comparable to.
+            return
+
+        try:
+            from .evidence_package import EvidenceEnvelope, MetricProvenance
+            from .evidence import evidence_for
+        except ImportError as imp:
+            self.envelope_error = f"evidence modules unavailable: {imp}"
+            return
+
+        try:
+            envelope = EvidenceEnvelope(
+                configuration=self._configuration,
+                evaluation=self._evaluation,
+                run_id=self.session_id,
+            )
+
+            # Fault events, where the injection layer recorded any. Absence is
+            # normal: a monitored run with no injected faults has none.
+            store = evidence_for(self, create=False)
+            event_ids = []
+            if store is not None:
+                for event in store.events:
+                    envelope.add_fault_event(event)
+                    event_ids.append(event.fault_event_id)
+
+            # INV-5C-2: the binding, if any, was supplied at session
+            # creation. A session that recorded a step without one stays
+            # UNAVAILABLE permanently - see bind_execution.
+            if self._execution_binding is not None:
+                envelope.bind_execution(self._execution_binding)
+
+            # Register every ref this run produced, so a metric citing
+            # something absent is reported as dangling rather than believed.
+            envelope.register_step_refs(
+                self._all_step_refs + self._episode_refs
+                + self._plan_transition_refs)
+
+            for name, provenance in self._metric_provenance(event_ids):
+                envelope.add_metric(provenance)
+
+            if exc_type is not None:
+                envelope.record_agent_exception(
+                    exc_type=getattr(exc_type, "__name__", str(exc_type)),
+                    at_step=self._step_count,
+                    message=str(exc) if exc is not None else "",
+                )
+
+            envelope.seal()
+            self.envelope = envelope  # type: ignore[assignment]
+
+        except Exception as build_exc:
+            # Partial construction must not survive. An envelope built halfway
+            # would verify as incomplete and be indistinguishable from a run
+            # that genuinely lacked provenance.
+            self.envelope = None
+            self.envelope_error = f"{type(build_exc).__name__}: {build_exc}"
+
+    def bind_execution(self, binding) -> None:
+        """Attach an execution identity to this session.
+
+        INV-5C-1  at most ONE binding per session; a second attempt raises.
+        INV-5C-2  binding is supplied at session creation. If a step has
+                  already been recorded, binding is REFUSED and the session
+                  stays UNAVAILABLE permanently.
+
+        WHY REFUSED RATHER THAN ALLOWED LATE
+        Binding after steps exist would retroactively attribute those steps to
+        an execution that did not exist when they occurred - the same
+        re-attribution INV-5C-1 forbids, arriving through the back door, and
+        it would make every downstream attribution unfalsifiable.
+        """
+        if self._execution_binding is not None:
+            raise ValueError(
+                "already bound to an execution. Re-binding would re-attribute "
+                "evidence to an execution that did not produce it.")
+        if self._step_count > 0:
+            raise ValueError(
+                f"cannot bind after {self._step_count} step(s) were recorded. "
+                f"Those steps occurred without an identity and cannot acquire "
+                f"one retroactively; this session stays UNAVAILABLE. Open a "
+                f"new session and bind it at creation.")
+        self._execution_binding = binding
+
+    @property
+    def identity_status(self) -> str:
+        """COMPLETE / PARTIAL / UNAVAILABLE.
+
+        UNAVAILABLE is permanent for a session that recorded a step before
+        being bound. Not an error - a truthful statement that this evidence
+        cannot be attributed to an execution.
+        """
+        if self._execution_binding is None:
+            return "UNAVAILABLE"
+        return self._execution_binding.identity_status
+
+    def _metric_provenance(self, event_ids: list):
+        """Yield (name, MetricProvenance) with TYPED refs per metric.
+
+        Refs come from lists maintained beside the counters and incremented at
+        exactly the same sites. Values are read from `live_metrics` unchanged:
+        this packages what was already computed and recomputes nothing,
+        because a second computation is a second chance to differ.
+
+        THE EQUALITY THIS MUST SATISFY
+            Actual Metric Inputs == Recorded Metric Provenance
+
+        No ref that did not enter the computation, none omitted that did.
+        Overlap between metrics is CORRECT where real: one faulted step
+        legitimately enters FRR's denominator and opens a PEI episode.
+        """
+        from .evidence_package import (MetricProvenance, MetricRef, RefType,
+                                       ProvenanceStatus)
+
+        V = {"pei": "2.0", "frr": "1.0", "irs": "2.0", "ti": "1.0",
+             "csi": "1.0-provisional"}
+        fault_refs = tuple(MetricRef(RefType.FAULT_EVENT, e)
+                           for e in event_ids)
+
+        def project(*groups):
+            """DEPRECATED contributing_event_ids - fault_event refs ONLY.
+
+            Lossy, and empty whenever a metric consumed no fault events.
+            Populating it with step or episode ids would put non-event ids in
+            a field named for events. See DW-021.
+            """
+            ids = []
+            for g in groups:
+                ids.extend(r.ref_id for r in g
+                           if r.ref_type == RefType.FAULT_EVENT)
+            return tuple(dict.fromkeys(ids))
+
+        live = self.live_metrics
+
+        def emit(name, num_refs, den_refs, num, den, reason, support=()):
+            v = live.get(name)
+            return MetricProvenance(
+                metric_name=name, value=v, metric_version=V[name],
+                numerator=num, denominator=den,
+                numerator_refs=num_refs, denominator_refs=den_refs,
+                supporting_refs=support,
+                provenance_status=ProvenanceStatus.APPLICABLE,
+                contributing_event_ids=project(num_refs, den_refs),
+                status="valid" if v is not None else "undefined",
+                undefined_reason=None if v is not None else reason)
+
+        # PEI - numerator compares EPISODES against TRANSITIONS; denominator
+        # is every step.
+        yield "pei", emit(
+            "pei",
+            tuple(self._episode_refs) + tuple(self._plan_transition_refs),
+            tuple(self._all_step_refs),
+            abs(self._n_fault_episodes - self._n_plan_transitions),
+            self._step_count, "no steps recorded", fault_refs)
+
+        # FRR - faulted STEPS.
+        yield "frr", emit(
+            "frr", tuple(self._faulted_survived_refs),
+            tuple(self._faulted_step_refs),
+            self._n_faulted_survived, self._n_faulted,
+            "no faulted steps occurred", fault_refs)
+
+        # IRS - judged EPISODES, not steps: two judged steps inside one
+        # episode are one judgement of one episode.
+        yield "irs", emit(
+            "irs", tuple(self._deliberate_episode_refs),
+            tuple(self._judged_episode_refs),
+            self._n_recovery_deliberate, self._n_recovery_judged,
+            "no fault episode carried a judgement", fault_refs)
+
+        # TI - traceable STEPS over all steps.
+        yield "ti", emit(
+            "ti", tuple(self._traceable_step_refs),
+            tuple(self._all_step_refs),
+            self._n_traceable, self._step_count, "no steps recorded")
+
+        # CSI - NOT_APPLICABLE, not empty-and-applicable.
+        #
+        # CSI needs a series across runs; a single live session has none. It
+        # does not read evidence and cannot fail to find inputs. Empty refs
+        # with APPLICABLE would say "we looked and found nothing", which is
+        # false: we did not look, because there is nothing here to look at.
+        yield "csi", MetricProvenance(
+            metric_name="csi", value=None, metric_version=V["csi"],
+            numerator_refs=(), denominator_refs=(),
+            provenance_status=ProvenanceStatus.NOT_APPLICABLE,
+            contributing_event_ids=(), status="undefined",
+            undefined_reason=("CSI requires a series of runs; a single live "
+                              "session has none"))
+
     def record_step(
         self,
         *,
@@ -517,11 +831,19 @@ class MonitorSession:
         self.steps.append(step)
         self._step_count += 1
 
+        # PHASE 5C: a ref for this step, mirroring the counter immediately
+        # above. The index is the counter's value here, so ref and count
+        # cannot drift.
+        _step_ref = MetricRef(RefType.STEP,
+                              f"ST-{self.session_id[:8]}-{self._step_count}")
+        self._all_step_refs.append(_step_ref)
+
         # O(1) tally update, replacing what was an O(n) rescan.
         if replanned:
             self._n_replans += 1
         if traceable:
             self._n_traceable += 1
+            self._traceable_step_refs.append(_step_ref)
         # A fault EPISODE opens on the first faulted step and stays open until
         # a clean step closes it.
         # `episode_opened_here` matters for the transition test below: the step
@@ -535,6 +857,11 @@ class MonitorSession:
                 self._n_fault_episodes += 1
                 self._in_fault_episode = True
                 episode_opened_here = True
+                # An EPISODE, not a step: it opens here and spans however many
+                # faulted steps follow, so it carries its own ref type.
+                self._episode_refs.append(MetricRef(
+                    RefType.EPISODE,
+                    f"EP-{self.session_id[:8]}-{self._n_fault_episodes}"))
         else:
             self._in_fault_episode = False
 
@@ -617,11 +944,19 @@ class MonitorSession:
             self._field_sources["plan_transition"] = "runtime_inferred"
         if observed_transition or replanned:
             self._n_plan_transitions += 1
+            # A PLAN TRANSITION is a property OF a step, not a step. It gets
+            # its own ref type so PEI's numerator can name both the episodes
+            # and the transitions it compares.
+            self._plan_transition_refs.append(MetricRef(
+                RefType.PLAN_TRANSITION,
+                f"PT-{self.session_id[:8]}-{self._step_count}"))
 
         if had_fault:
             self._n_faulted += 1
+            self._faulted_step_refs.append(_step_ref)
             if success:
                 self._n_faulted_survived += 1
+                self._faulted_survived_refs.append(_step_ref)
             # IRS v2 counts DELIBERATE HANDLING, of which recovery is one of
             # three forms.
             #
@@ -644,8 +979,17 @@ class MonitorSession:
                 deliberate = deliberate or bool(handled_deliberately)
             if judged:
                 self._n_recovery_judged += 1
+                # IRS judges EPISODES. The ref is the episode currently open,
+                # which is the last one appended - not the step, because two
+                # judged steps inside one episode are one judgement of one
+                # episode.
+                _ep = (self._episode_refs[-1] if self._episode_refs
+                       else MetricRef(RefType.EPISODE,
+                                      f"EP-{self.session_id[:8]}-0"))
+                self._judged_episode_refs.append(_ep)
                 if deliberate:
                     self._n_recovery_deliberate += 1
+                    self._deliberate_episode_refs.append(_ep)
 
         self._recompute()
         new_breaches = self._check_thresholds()

@@ -1,0 +1,45 @@
+{
+  "base_task_hash": "task-hash",
+  "baseline_hash": "sha256:2c44d478f3dbdd64074eb26e177600f1fa05ad63e201f81f0ca8b3b3139c2c85",
+  "baseline_id": "BL-4ad0b2fc31393eb6",
+  "battery_instance_id": "BI-x",
+  "battery_slot_id": "BS-x",
+  "battery_spec_fingerprint": "ce481b32763df1ca",
+  "configuration_fingerprint": "CFP-3aad19a3298eebe2",
+  "envelope_hash": "sha256:5f1163a77aded9df285f1748b0ad7b631ac082d350edddecb304fb5ec5a88088",
+  "evaluation_fingerprint": "EVI-7079bba56eac4c27",
+  "execution_id": "EX-baseline00001",
+  "execution_semantics_hash": "sem-hash",
+  "metrics": [
+    [
+      "csi",
+      null,
+      "1.0-provisional",
+      "not_applicable"
+    ],
+    [
+      "frr",
+      0.5,
+      "1.0",
+      "applicable"
+    ],
+    [
+      "irs",
+      1.0,
+      "2.0",
+      "applicable"
+    ],
+    [
+      "pei",
+      1.0,
+      "2.0",
+      "applicable"
+    ],
+    [
+      "ti",
+      5.0,
+      "1.0",
+      "applicable"
+    ]
+  ]
+}

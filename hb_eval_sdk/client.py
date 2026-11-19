@@ -42,7 +42,11 @@ from .utils import (
     compute_signature,
 )
 from .validation import validate_payload
+import ipaddress
+import os
 import time
+from urllib.parse import urlparse
+from typing import Optional
 
 
 class HBEvalClient:
@@ -67,17 +71,29 @@ class HBEvalClient:
         api_key: str,
         aes_key: str,
         signing_secret: str,
-        gateway_url: str = None,
-        timeout: int = None,
-        max_retries: int = None,
+        gateway_url: Optional[str] = None,
+        timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        allow_insecure_http: bool = False,
     ):
         if not api_key or not isinstance(api_key, str):
             raise EncryptionError("api_key is required and must be a string.")
 
         self.api_key = api_key
-        self.timeout = timeout or config.DEFAULT_TIMEOUT
-        self.max_retries = max_retries or config.DEFAULT_MAX_RETRIES
-        self.gateway_url = (gateway_url or config.DEFAULT_GATEWAY_URL).rstrip("/")
+        # `or` would silently turn an explicit 0 into the default; None is the only "unset".
+        self.timeout = config.DEFAULT_TIMEOUT if timeout is None else timeout
+        self.max_retries = config.DEFAULT_MAX_RETRIES if max_retries is None else max_retries
+        if isinstance(self.timeout, bool) or not isinstance(self.timeout, (int, float)) or self.timeout <= 0:
+            from .exceptions import ValidationError
+            raise ValidationError("timeout must be a positive number of seconds.")
+        if isinstance(self.max_retries, bool) or not isinstance(self.max_retries, int) or self.max_retries < 0:
+            from .exceptions import ValidationError
+            raise ValidationError("max_retries must be an integer >= 0.")
+        # Resolution order: argument, then HBEVAL_GATEWAY_URL, then the built-in default.
+        # None means "unset". An explicit empty string is a configuration bug (an unset variable
+        # passed through) and must not silently redirect traffic to the default Gateway.
+        chosen = gateway_url if gateway_url is not None else (os.environ.get("HBEVAL_GATEWAY_URL") or config.DEFAULT_GATEWAY_URL)
+        self.gateway_url = self._validate_gateway_url(chosen, allow_insecure_http).rstrip("/")
 
         # Decode and validate the AES key — must be exactly 32 bytes (AES-256).
         try:
@@ -123,6 +139,33 @@ class HBEvalClient:
 
     # ── headers (Protocol §3, §4) ───────────────────────────────────────────
 
+    def _post(self, *args, **kwargs):
+        """requests.post, plus the one-time wire-protocol compatibility check."""
+        # A caller that forgets a timeout must not be able to hang the agent forever.
+        timeout = kwargs.pop("timeout", self.timeout)
+        response = requests.post(*args, timeout=timeout, **kwargs)
+        self._check_protocol(response)
+        return response
+
+    def _check_protocol(self, response) -> None:
+        if getattr(self, "_protocol_checked", False):
+            return
+        try:
+            headers = getattr(response, "headers", None)
+            raw = headers.get("X-HBEval-Protocol") if headers is not None else None
+        except Exception:                      # a response we cannot read is not a protocol event
+            return
+        peer = raw if isinstance(raw, str) else None
+        from . import protocol as _protocol
+        verdict = _protocol.compare(config.PROTOCOL_VERSION, peer)
+        self._protocol_checked = True
+        self.gateway_protocol = peer
+        self.protocol_compatibility = verdict
+        if verdict.level in (_protocol.WARN, _protocol.INCOMPATIBLE):
+            import warnings
+            from .exceptions import ProtocolMismatchWarning
+            warnings.warn(verdict.message, ProtocolMismatchWarning, stacklevel=3)
+
     def _build_headers(self, nonce_hex: str, timestamp: str, ciphertext_hex: str) -> dict:
         """
         Build request headers including the canonical signature.
@@ -143,7 +186,7 @@ class HBEvalClient:
 
     # ── public API ──────────────────────────────────────────────────────────
 
-    def evaluate(self, payload: dict, max_retries: int = None) -> EvaluationResult:
+    def evaluate(self, payload: dict, max_retries: Optional[int] = None) -> EvaluationResult:
         """
         Evaluate an agent trajectory and return its reliability result.
 
@@ -156,14 +199,14 @@ class HBEvalClient:
         # Local validation first — defense in depth, fast clear errors.
         validate_payload(payload)
 
-        retries = max_retries if max_retries is not None else self.max_retries
+        retries = self._resolve_retries(max_retries)
         for attempt in range(retries + 1):
             try:
                 nonce_hex, ciphertext_hex = self._encrypt(payload)
                 timestamp = generate_timestamp()
                 headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
 
-                response = requests.post(
+                response = self._post(
                     f"{self.gateway_url}/evaluate",
                     json={"ciphertext": ciphertext_hex},
                     headers=headers,
@@ -200,17 +243,18 @@ class HBEvalClient:
             except Exception as exc:
                 # Unknown failure — fail closed without echoing internals.
                 raise ConnectionError("An unexpected error occurred during evaluation.") from exc
+        raise AssertionError("unreachable: the retry loop always returns or raises")
 
     def evaluate_with_battery(
         self,
         base_task: dict,
         agent_runner,
         n_scenarios: int = 18,
-        required_in_response: list = None,
-        seed: int = None,
-        fault_types: list = None,
-        domains: list = None,
-        max_retries: int = None,
+        required_in_response: Optional[list] = None,
+        seed: Optional[int] = None,
+        fault_types: Optional[list] = None,
+        domains: Optional[list] = None,
+        max_retries: Optional[int] = None,
     ) -> dict:
         """Local active evaluation (path B, free).
 
@@ -263,13 +307,13 @@ class HBEvalClient:
             "battery_spec": battery_spec_fingerprint(),
         }
 
-        retries = max_retries if max_retries is not None else self.max_retries
+        retries = self._resolve_retries(max_retries)
         for attempt in range(retries + 1):
             try:
                 nonce_hex, ciphertext_hex = self._encrypt(payload)
                 timestamp = generate_timestamp()
                 headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
-                response = requests.post(
+                response = self._post(
                     f"{self.gateway_url}/evaluate_battery",
                     json={"ciphertext": ciphertext_hex},
                     headers=headers, timeout=self.timeout,
@@ -294,6 +338,7 @@ class HBEvalClient:
                 raise
             except Exception as exc:
                 raise ConnectionError("An unexpected error occurred during battery evaluation.") from exc
+        raise AssertionError("unreachable: the retry loop always returns or raises")
 
     def request_verified_evaluation(
         self,
@@ -301,9 +346,9 @@ class HBEvalClient:
         base_task: dict,
         consent: bool,
         n_scenarios: int = 30,
-        agent_headers: dict = None,
-        required_in_response: list = None,
-        max_retries: int = None,
+        agent_headers: Optional[dict] = None,
+        required_in_response: Optional[list] = None,
+        max_retries: Optional[int] = None,
     ) -> dict:
         """Verified active evaluation (path A, paid).
 
@@ -334,13 +379,13 @@ class HBEvalClient:
             "agent_id": base_task.get("agent_id", "verified-agent"),
         }
 
-        retries = max_retries if max_retries is not None else self.max_retries
+        retries = self._resolve_retries(max_retries)
         for attempt in range(retries + 1):
             try:
                 nonce_hex, ciphertext_hex = self._encrypt(payload)
                 timestamp = generate_timestamp()
                 headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
-                response = requests.post(
+                response = self._post(
                     f"{self.gateway_url}/evaluate_verified",
                     json={"ciphertext": ciphertext_hex},
                     headers=headers, timeout=self.timeout,
@@ -369,8 +414,9 @@ class HBEvalClient:
                 raise
             except Exception as exc:
                 raise ConnectionError("An unexpected error occurred during verified evaluation.") from exc
+        raise AssertionError("unreachable: the retry loop always returns or raises")
 
-    def retrieve_memory(self, context: str, project_id: str = None, top_k: int = 5) -> list:
+    def retrieve_memory(self, context: str, project_id: Optional[str] = None, top_k: int = 5) -> list:
         """
         Retrieve semantically similar past episodes from EDM.
 
@@ -390,7 +436,7 @@ class HBEvalClient:
         headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
 
         try:
-            response = requests.post(
+            response = self._post(
                 f"{self.gateway_url}/api/v1/memory/retrieve",
                 json={"ciphertext": ciphertext_hex},
                 headers=headers,
@@ -425,7 +471,7 @@ class HBEvalClient:
         headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
 
         try:
-            response = requests.post(
+            response = self._post(
                 f"{self.gateway_url}/api/v1/explain",
                 json={"ciphertext": ciphertext_hex},
                 headers=headers,
@@ -469,7 +515,7 @@ class HBEvalClient:
         headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
 
         try:
-            response = requests.post(
+            response = self._post(
                 f"{self.gateway_url}/api/v1/observatory/consent",
                 json={"ciphertext": ciphertext_hex},
                 headers=headers,
@@ -503,7 +549,7 @@ class HBEvalClient:
         headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
 
         try:
-            response = requests.post(
+            response = self._post(
                 f"{self.gateway_url}/api/v1/monitoring/trend",
                 json={"ciphertext": ciphertext_hex},
                 headers=headers,
@@ -521,16 +567,19 @@ class HBEvalClient:
         self,
         agent_id: str,
         *,
-        thresholds: dict = None,
+        thresholds: Optional[dict] = None,
         on_threshold_breach=None,
         halt_signal=None,
-        halt_policy: dict = None,
-        policies: list = None,
-        tool_policy: dict = None,
+        halt_policy: Optional[dict] = None,
+        policies: Optional[list] = None,
+        tool_policy: Optional[dict] = None,
         send_summary: bool = True,
         stream: bool = True,
         batch_size: int = 5,
         flush_interval: float = 2.0,
+        configuration=None,
+        evaluation=None,
+        execution_binding=None,
         **session_metadata,
     ):
         """Open a runtime monitoring session over a live agent run.
@@ -616,6 +665,12 @@ class HBEvalClient:
             batch_size=batch_size,
             flush_interval=flush_interval,
             session_metadata=session_metadata or None,
+            # Phase 5A. Passed straight through: the client does not see
+            # individual steps, so it cannot own envelope production, and
+            # putting logic here would invert the dependency.
+            configuration=configuration,
+            evaluation=evaluation,
+            execution_binding=execution_binding,
         )
 
     def _send_monitoring_batch(self, batch: dict) -> None:
@@ -635,7 +690,7 @@ class HBEvalClient:
         nonce_hex, ciphertext_hex = self._encrypt(batch)
         timestamp = generate_timestamp()
         headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
-        response = requests.post(
+        response = self._post(
             f"{self.gateway_url}/api/v1/monitoring/stream",
             json={"ciphertext": ciphertext_hex},
             headers=headers,
@@ -661,7 +716,7 @@ class HBEvalClient:
             nonce_hex, ciphertext_hex = self._encrypt(summary)
             timestamp = generate_timestamp()
             headers = self._build_headers(nonce_hex, timestamp, ciphertext_hex)
-            requests.post(
+            self._post(
                 f"{self.gateway_url}/api/v1/monitoring/session",
                 json={"ciphertext": ciphertext_hex},
                 headers=headers,
@@ -672,6 +727,43 @@ class HBEvalClient:
             return
 
     # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _resolve_retries(self, override: Optional[int]) -> int:
+        """The per-call override beats the constructor value, and is validated like it.
+        A negative count used to make `range(retries + 1)` empty, so the method fell off its
+        own end and returned None instead of halting: a reliability gate failing open."""
+        retries = self.max_retries if override is None else override
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            from .exceptions import ValidationError
+            raise ValidationError("max_retries must be an integer >= 0.")
+        return retries
+
+    @staticmethod
+    def _validate_gateway_url(url: str, allow_insecure_http: bool = False) -> str:
+        """Every request carries the API key as a bearer token, so a plain-http gateway
+        would expose it. https is required; http is accepted only for loopback (local
+        development) or when the caller opts in explicitly."""
+        from .exceptions import ValidationError
+        if not isinstance(url, str) or not url.strip():
+            raise ValidationError("gateway_url must be a non-empty string.")
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValidationError(f"gateway_url must be an http(s) URL with a host (got {url!r}).")
+        if parsed.username or parsed.password:
+            raise ValidationError("gateway_url must not embed credentials.")
+        if parsed.scheme == "https":
+            return url.strip()
+        host = parsed.hostname
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host == "localhost"
+        if loopback or allow_insecure_http:
+            return url.strip()
+        raise ValidationError(
+            "gateway_url uses plain http to a non-loopback host, which would send your API key "
+            "unencrypted. Use https, or pass allow_insecure_http=True if the network is trusted."
+        )
 
     @staticmethod
     def _safe_detail(response, fallback: str) -> str:
@@ -710,4 +802,8 @@ class HBEvalClient:
             reason=data.get("reason"),
             note=data.get("note"),
             guidance=data.get("guidance"),
+            qualified=data.get("qualified"),
+            tier_status=data.get("tier_status"),
+            tier_provisional=data.get("tier_provisional"),
+            unmeasured_metrics=list(data.get("unmeasured_metrics") or []),
         )

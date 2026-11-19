@@ -147,11 +147,19 @@ def run_demo(*, connect: bool = False, fast: bool = False,
     print()
 
     # ── Client ──
+    client = None
     if streaming:
-        client = HBEvalClient(api_key=creds["HBEVAL_API_KEY"],
-                              aes_key=creds["HBEVAL_AES_KEY"],
-                              signing_secret=creds["HBEVAL_SIGNING_SECRET"])
-    else:
+        try:
+            client = HBEvalClient(api_key=creds["HBEVAL_API_KEY"],
+                                  aes_key=creds["HBEVAL_AES_KEY"],
+                                  signing_secret=creds["HBEVAL_SIGNING_SECRET"])
+        except Exception as exc:
+            # A demo should never greet a new user with a traceback. Bad credentials mean
+            # "run offline and say so", which is also what happens when they are absent.
+            print(amber(f"  The credentials in the environment are not usable ({type(exc).__name__}: {exc})."))
+            print(dim("  Running offline instead."))
+            streaming = False
+    if client is None:
         # Offline: a client whose transport is never used, so the demo runs
         # the real MonitorSession rather than a stand-in. Same code path, same
         # arithmetic — only the destination differs.
@@ -161,7 +169,7 @@ def run_demo(*, connect: bool = False, fast: bool = False,
                 raise ConnectionError("offline")
             def _send_monitoring_summary(self, summary):
                 return None
-        client = _OfflineClient()
+        client = _OfflineClient()  # type: ignore[assignment]
 
     breaches: list[tuple[str, float, float, int]] = []
     announced: set = set()      # metrics whose first crossing has been shown
@@ -239,9 +247,9 @@ def run_demo(*, connect: bool = False, fast: bool = False,
     print(rule())
     print(bold("  Result"))
     print()
-    for key, label, floor in (("pei", "Planning Efficiency", DEFAULT_THRESHOLDS["pei"]),
+    for key, label, floor in (("pei", "Planning Efficiency", DEFAULT_THRESHOLDS["pei"]),  # type: ignore[assignment]
                               ("frr", "Failure Resilience", DEFAULT_THRESHOLDS["frr"]),
-                              ("irs", "Deliberate Handling", DEFAULT_THRESHOLDS["irs"]),
+                              ("irs", "Intentional Recovery", DEFAULT_THRESHOLDS["irs"]),
                               ("ti",  "Traceability", DEFAULT_THRESHOLDS["ti"]),
                               ("csi", "Consistency Stability", None)):
         v = lm.get(key)

@@ -33,6 +33,8 @@ Usage
 from __future__ import annotations
 from typing import Any, Callable, Optional
 
+from ._adapters import content_to_text
+
 
 def adapt_langgraph_agent(
     compiled_graph: Any,
@@ -80,10 +82,13 @@ def adapt_langgraph_agent(
         if not msgs:
             return str(result_state)
 
-        last = msgs[-1]
+        # The agent's answer is its last AI message. A graph can legitimately end on a tool or human
+        # message (a final tool node, a human-in-the-loop step); returning that would score the
+        # tool's output as the agent's reply. Fall back to the last message only if none is AI.
+        last = next((m for m in reversed(msgs) if getattr(m, "type", None) == "ai"), msgs[-1])
         content = getattr(last, "content", None)
         if content is not None:
-            return str(content)
+            return content_to_text(content)
         if isinstance(last, tuple) and len(last) == 2:
             return str(last[1])
         return str(last)
@@ -111,8 +116,8 @@ def adapt_langgraph_node(
         msgs = result.get(messages_key) if isinstance(result, dict) else None
         if not msgs:
             return str(result)
-        last = msgs[-1]
+        last = next((m for m in reversed(msgs) if getattr(m, "type", None) == "ai"), msgs[-1])
         content = getattr(last, "content", None)
-        return str(content) if content is not None else str(last)
+        return content_to_text(content) if content is not None else str(last)
 
     return agent_runner

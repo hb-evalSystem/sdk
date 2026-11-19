@@ -49,7 +49,7 @@ try:
                            new_event,
                            seal, _instrumentation_token)
 except ImportError:      # direct execution, e.g. from tests/
-    from evidence import (FaultEvent, PendingFaultEvent, InjectionStatus,
+    from evidence import (FaultEvent, PendingFaultEvent, InjectionStatus,  # type: ignore[no-redef]
                           ObservedOutcome, evidence_for, evidence_for_session,
                           new_event,
                           seal, _instrumentation_token)
@@ -83,6 +83,48 @@ class FaultInjected(Exception):
         super().__init__(detail or f"injected {mode} on {target}")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  THE TAXONOMY
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Three classes, distinguished by WHERE the failure appears rather than by how
+# it is implemented. The distinction matters because an agent's ability to
+# notice a fault depends almost entirely on which class it belongs to.
+#
+#   EXECUTION   the call did not complete
+#               loud. Any agent with a try/except sees it.
+#
+#   OUTPUT      the call completed and returned something unusable
+#               quieter. Requires the agent to inspect what it got back.
+#
+#   STATE       the call completed and returned something plausible and wrong
+#               silent. Nothing raises, nothing looks empty, and the only
+#               defence is the agent checking its own assumptions.
+#
+# The classes are ordered by how hard they are to detect, and that ordering is
+# the point of having them: an agent scoring well on EXECUTION faults has
+# demonstrated it can catch exceptions, which is not the same as being
+# reliable.
+
+FAULT_CLASSES = {
+    "execution": ("timeout", "tool_exception", "connection_refused",
+                  "error_5xx", "intermittent", "latency"),
+    "output": ("empty_response", "malformed", "wrong_response"),
+    "state": ("stale_context", "contradictory_context", "corrupted_result",
+              "memory_contamination"),
+}
+
+
+def fault_class(mode: str) -> str:
+    """Which class a mode belongs to. Used for per-class reporting: an agent
+    that survives every EXECUTION fault and no STATE fault has a specific,
+    nameable weakness rather than a middling average."""
+    for cls, modes in FAULT_CLASSES.items():
+        if mode in modes:
+            return cls
+    return "unknown"
+
+
 FAULT_MODES = {
     "timeout": "Blocks for the configured delay, then raises. Synthetic: the "
                "underlying call is never made.",
@@ -95,6 +137,28 @@ FAULT_MODES = {
     "intermittent": "Fails with probability p. The hardest shape to handle: a "
                     "retry sometimes works and teaches the wrong lesson.",
     "connection_refused": "Raises as an unreachable host would.",
+
+    # ── added in v2.0, per specification section 7 ──────────────────
+    "tool_exception": "The tool raises a domain exception of its own — not a "
+                      "transport failure but the tool refusing the request.",
+
+    "wrong_response": "Returns structurally valid data with FALSE semantics. "
+                      "The call succeeds, the schema validates, and the "
+                      "content is wrong. The only fault where nothing in the "
+                      "response signals that anything happened.",
+
+    "stale_context": "Returns data from an earlier point in time, correct "
+                     "when it was written and wrong now.",
+
+    "contradictory_context": "Returns data that conflicts with something the "
+                             "agent already holds. Both look valid.",
+
+    "corrupted_result": "Returns a result altered while preserving enough "
+                        "structure to appear plausible.",
+
+    "memory_contamination": "Returns data consistent with a previous but "
+                            "different request — the shape of a cache "
+                            "collision.",
 }
 
 
@@ -124,6 +188,24 @@ class FaultSpec:
     http_status: Optional[int] = None
     empty_kind: str = "null"          # null | empty_object | empty_array | empty_string
     malformed_kind: str = "wrong_schema"
+
+    # ── OUTPUT / STATE fault parameters, v2.0 ───────────────────────
+    #
+    # wrong_response and the state faults need to know WHAT to corrupt, which
+    # the other modes do not: a timeout is the same timeout regardless of what
+    # the tool returns, but a semantically wrong answer has to be wrong about
+    # something specific.
+    wrong_field: Optional[str] = None
+    """Which field to falsify. None falsifies every numeric field found."""
+
+    wrong_value: Any = None
+    """What to put there. None derives a plausible-but-wrong value."""
+
+    staleness_hours: int = 24
+    """For stale_context: how old the returned data claims to be."""
+
+    contradiction: Optional[dict] = None
+    """For contradictory_context: the conflicting values to introduce."""
 
     def __post_init__(self):
         if self.mode not in FAULT_MODES:
@@ -175,6 +257,7 @@ class FaultPlan:
         return hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
 
     def for_target(self, target: str) -> Optional[FaultSpec]:
+        """The first fault spec in the plan that targets `target`, or None."""
         for f in self.faults:
             if f.target == target:
                 return f
@@ -226,6 +309,7 @@ class CascadePlan:
     stages: list = field(default_factory=list)
 
     def fingerprint(self) -> str:
+        """A deterministic digest of the plan's seed and stages. Equal fingerprints mean the same cascade will be applied."""
         body = {
             "seed": self.seed,
             "stages": [
@@ -489,6 +573,121 @@ def _malformed_value(kind: str):
     return {"unexpected": True}
 
 
+def _corrupt_result(real: Any, mode: str, spec: "FaultSpec") -> Any:
+    """Turn a correct result into a plausible incorrect one.
+
+    WHY THIS OPERATES ON THE REAL RESULT
+    A fabricated response would be easy for an agent to reject on shape alone.
+    These faults exist to test whether an agent notices when the shape is
+    RIGHT and the content is wrong, so the corruption starts from what the
+    tool actually returned and changes as little as possible.
+
+    WHY THE CHANGES ARE LARGE, NOT SUBTLE
+    `wrong_response` multiplies a numeric field rather than nudging it. A
+    subtle change tests whether the agent has an independent source to compare
+    against, which is a different question and usually unanswerable. A large
+    change tests whether the agent sanity-checks at all — an ETA of 6 hours
+    reported as 31 is the kind of error a careful agent catches by noticing it
+    contradicts something else it was told.
+    """
+    if not isinstance(real, dict):
+        # Non-dict results have no fields to falsify. Returning them unchanged
+        # would silently no-op the fault, so the caller is told instead.
+        return {"_hbeval_uncorruptable": True, "original_type":
+                type(real).__name__, "value": real}
+
+    out = dict(real)
+
+    if mode == "wrong_response":
+        # Falsify the named field, or every numeric field if none was named.
+        if spec.wrong_field and spec.wrong_field in out:
+            out[spec.wrong_field] = (
+                spec.wrong_value if spec.wrong_value is not None
+                else _plausible_wrong(out[spec.wrong_field]))
+        else:
+            for k, v in list(out.items()):
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    out[k] = _plausible_wrong(v)
+        return out
+
+    if mode == "stale_context":
+        # Data that was true earlier. The tell is a timestamp the agent has to
+        # notice and reason about, which is exactly the behaviour under test.
+        out["as_of_hours_ago"] = spec.staleness_hours
+        for k, v in list(out.items()):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) \
+                    and "hour" in k.lower():
+                out[k] = v + spec.staleness_hours
+        return out
+
+    if mode == "contradictory_context":
+        # Two valid-looking facts that cannot both be true. Neither is
+        # marked; the agent has to notice the conflict.
+        if spec.contradiction:
+            out.update(spec.contradiction)
+        else:
+            out["status"] = "delivered"
+            out["eta_hours"] = out.get("eta_hours", 6)
+        out["_conflict_note"] = ("status and eta_hours disagree: a delivered "
+                                 "shipment has no remaining ETA")
+        return out
+
+    if mode == "corrupted_result":
+        # Structure preserved, values scrambled. Plausible field by field,
+        # incoherent taken together.
+        for k, v in list(out.items()):
+            if isinstance(v, str) and len(v) > 3:
+                out[k] = v[::-1]
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = _plausible_wrong(v)
+        return out
+
+    if mode == "memory_contamination":
+        # A correct answer to a DIFFERENT question — the shape of a cache
+        # keyed on the wrong thing. Everything is internally consistent and
+        # belongs to someone else's request.
+        #
+        # An earlier version matched only field names containing "id", and
+        # silently did nothing on a result whose identifier field was called
+        # "order". A contamination fault that contaminates nothing is worse
+        # than no fault: the evidence records WRONG while the agent received
+        # correct data, so the run measures nothing and looks like it did.
+        # Identifier detection is now by VALUE SHAPE as well as name.
+        contaminated = False
+        for k, v in list(out.items()):
+            name_looks_like_id = any(
+                marker in k.lower()
+                for marker in ("id", "order", "ref", "key", "number", "num"))
+            value_looks_like_id = (
+                isinstance(v, str) and len(v) >= 4
+                and any(ch.isdigit() for ch in v)
+                and any(ch in v for ch in "-_"))
+            if name_looks_like_id or value_looks_like_id:
+                out[k] = "ORD-0000"
+                contaminated = True
+
+        if not contaminated:
+            # Nothing identifier-shaped to swap. Say so rather than returning
+            # the correct result while claiming a fault fired.
+            out["_hbeval_contamination_ineffective"] = (
+                "no identifier-shaped field found to contaminate")
+        out["_contaminated_from"] = "a previous, different request"
+        return out
+
+    return out
+
+
+def _plausible_wrong(value):
+    """A wrong value that still looks like a value of its type."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value * 5 + 1
+    if isinstance(value, float):
+        return round(value * 5 + 1, 2)
+    return value
+
+
 def wrap_tool(fn: Callable, target: str) -> Callable:
     """Make `fn` injectable under a matching `fault_context`.
 
@@ -553,8 +752,8 @@ def wrap_tool(fn: Callable, target: str) -> Callable:
 
     wrapped.__name__ = getattr(fn, "__name__", "wrapped_tool")
     wrapped.__doc__ = getattr(fn, "__doc__", None)
-    wrapped.__wrapped__ = fn
-    wrapped._hbeval_target = target
+    wrapped.__wrapped__ = fn  # type: ignore[attr-defined]
+    wrapped._hbeval_target = target  # type: ignore[attr-defined]
     return wrapped
 
 
@@ -676,6 +875,45 @@ def _apply(spec: FaultSpec, target: str, event: PendingFaultEvent,
         event.response_shape = spec.malformed_kind
         return _malformed_value(spec.malformed_kind)
 
+    if mode == "tool_exception":
+        # Distinct from error_5xx: this is the tool's own domain exception,
+        # not a transport failure. An agent may reasonably treat the two
+        # differently — a 503 invites a retry, a ValidationError does not.
+        event.observed_outcome = ObservedOutcome.EXCEPTION
+        event.exception_type = "FaultInjected"
+        event.injection_note = "tool-level domain exception"
+        raise FaultInjected(mode, target,
+                            f"{target} rejected the request")
+
+    # ── OUTPUT / STATE: the call SUCCEEDS and returns something wrong ──
+    #
+    # Everything below returns rather than raising. That is the entire
+    # difference and the reason these faults matter: an agent's try/except
+    # never fires, the schema validates, and the only defence is that the
+    # agent questions data it has no reason to question.
+    if mode in ("wrong_response", "stale_context", "contradictory_context",
+                "corrupted_result", "memory_contamination"):
+        try:
+            real = fn(*args, **kwargs)
+        except Exception as exc:
+            # The tool failed on its own. The injection applied but could not
+            # manifest as intended, and that is recorded rather than smoothed
+            # over — an OUTPUT fault that turned into an EXCEPTION is not the
+            # fault the plan asked for.
+            event.observed_outcome = ObservedOutcome.EXCEPTION
+            event.exception_type = type(exc).__name__
+            event.injection_status = InjectionStatus.PARTIAL
+            event.injection_note = (
+                "underlying call failed; the semantic fault could not be "
+                "applied to a result that does not exist")
+            raise
+
+        corrupted = _corrupt_result(real, mode, spec)
+        event.observed_outcome = ObservedOutcome.WRONG
+        event.response_shape = mode
+        event.injection_note = f"{mode}: returned plausible incorrect data"
+        return corrupted
+
     # Unreachable: FaultSpec validates the mode on construction. Recorded as a
     # failed injection rather than silently passing through, because a mode
     # reaching here means validation and dispatch have drifted apart.
@@ -705,5 +943,10 @@ def _commit(state: dict, pending) -> None:
     try:
         sealed = seal(pending)
         store.record(sealed, _token=_TOKEN)
-    except Exception:
-        pass
+    except Exception as exc:
+        # Still never agent-visible (see above) — but evidence that failed to record
+        # must not vanish without a trace, or a study would silently under-count.
+        import logging
+        logging.getLogger("hb_eval_sdk.faults").warning(
+            "fault evidence could not be recorded (%s); this event is missing from the store",
+            type(exc).__name__)

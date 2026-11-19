@@ -149,7 +149,19 @@ class HBEvalSpanProcessor:
         self._lock = threading.Lock()
 
     # ── OTel SpanProcessor interface ────────────────────────────────────────
-    def on_start(self, span: Any, parent_context: Any = None) -> None:
+    def _warn_once(self, key: str, message: str) -> None:
+        """A monitoring failure must never reach the agent, but it must not be invisible either:
+        a session that silently never opens looks exactly like an agent with nothing to report.
+        The first occurrence of each kind is a WARNING; repeats drop to DEBUG so a hot path
+        cannot flood the log."""
+        warned = self.__dict__.setdefault("_warned", set())
+        if key in warned:
+            logger.debug(message, exc_info=True)
+            return
+        warned.add(key)
+        logger.warning("%s (further occurrences of this are logged at DEBUG)", message, exc_info=True)
+
+    def on_start(self, span: Any, parent_context: Optional[Any] = None) -> None:
         """Open a session when the agent's root span begins."""
         try:
             rec = _to_record(span)
@@ -164,7 +176,7 @@ class HBEvalSpanProcessor:
                 self._open(rec)
         except Exception:
             # Never let instrumentation break the traced application.
-            logger.debug("HB-Eval on_start failed", exc_info=True)
+            self._warn_once("on_start", "HB-Eval on_start failed; this span was not observed")
 
     def on_end(self, span: Any) -> None:
         """Record a step, or close the session when the root span ends.
@@ -204,13 +216,15 @@ class HBEvalSpanProcessor:
                     )
                     self._close_async()
         except Exception:
-            logger.debug("HB-Eval on_end failed", exc_info=True)
+            self._warn_once("on_end", "HB-Eval on_end failed; this span was not recorded")
 
     def shutdown(self) -> None:
+        """Close any open monitoring session. Called by the tracer provider on shutdown."""
         with self._lock:
             self._close_async()
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        """Always returns True: this processor buffers nothing, because sessions stream through their own worker."""
         return True
 
     # ── Internals ───────────────────────────────────────────────────────────
@@ -245,7 +259,7 @@ class HBEvalSpanProcessor:
             )
             session.__enter__()
         except Exception:
-            logger.debug("HB-Eval could not open a session", exc_info=True)
+            self._warn_once("open", "HB-Eval could not open a monitoring session; this run is not monitored")
             return
 
         self._session = session
@@ -269,7 +283,7 @@ class HBEvalSpanProcessor:
             try:
                 session.__exit__(None, None, None)
             except Exception:
-                logger.debug("HB-Eval session close failed", exc_info=True)
+                self._warn_once("close", "HB-Eval session close failed; its summary may not have been sent")
 
         threading.Thread(
             target=_finish, name="hbeval-otel-close", daemon=True

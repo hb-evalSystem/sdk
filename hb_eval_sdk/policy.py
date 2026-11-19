@@ -118,6 +118,7 @@ class Directive:
     occurred_at: float = field(default_factory=time.time)
 
     def as_dict(self) -> dict:
+        """The JSON-serialisable form: the action, why, the metric, its value, the threshold and how many consecutive steps breached it."""
         return {
             "action": self.action,
             "reason": self.reason,
@@ -132,30 +133,73 @@ class Directive:
         }
 
 
-def normalise_policies(policies: Any) -> list[dict]:
+KNOWN_METRICS = ("pei", "frr", "irs", "ti", "csi")
+
+
+def _ineligible_reason(metric: str) -> Optional[str]:
+    """Why a metric may not drive a live decision, or None. Mirrors halt_policy's rule: a policy
+    that is accepted but can never fire gives a false sense of protection."""
+    try:
+        from .contracts import CONTRACTS
+    except ImportError:                       # pragma: no cover
+        return None
+    contract = CONTRACTS.get(metric)
+    if contract is not None and not contract.safety_eligible:
+        return f"{metric} is not eligible for safety decisions in a live session"
+    return None
+
+
+def normalise_policies(policies: Any, dropped: Optional[list] = None) -> list[dict]:
     """Validate and normalise the policy list.
 
-    Invalid entries are DROPPED rather than raising. A typo in one rule must
-    not take down an agent run that the other rules were protecting — but a
-    silently ignored policy is its own hazard, so each dropped rule carries a
-    reason that surfaces in the session summary.
+    Invalid entries are DROPPED rather than raising: a typo in one rule must not take down an agent
+    run that the other rules were protecting. But a silently ignored rule is its own hazard, so every
+    dropped rule is appended to `dropped` (when given) with the reason, and PolicyEngine reports them
+    in its summary and log. Previously nothing was recorded, so `"then": "stop"` or a misspelt metric
+    left the agent unprotected with no trace.
     """
+    def drop(index: int, raw: Any, reason: str) -> None:
+        if dropped is not None:
+            dropped.append({"index": index, "rule": repr(raw)[:200], "reason": reason})
+
     if not policies:
         return []
+    if not isinstance(policies, (list, tuple)):
+        # `policies=True`, a dict, or a string used to be iterated (a string character by character,
+        # a bool not at all: TypeError). One bad argument is one reported problem, not a crash.
+        drop(0, policies, "policies must be a list of rule dicts")
+        return []
     out: list[dict] = []
-    for raw in policies:
+    for index, raw in enumerate(policies):
         if not isinstance(raw, dict):
+            drop(index, raw, "a policy must be a dict like {'when': {...}, 'then': 'halt'}")
             continue
-        when = raw.get("when") or {}
+        when = raw.get("when")
+        if not isinstance(when, dict):
+            drop(index, raw, "'when' must be a dict with 'metric' and 'below'")
+            continue
         action = str(raw.get("then", "")).strip().lower()
         metric = str(when.get("metric", "")).strip().lower()
         below = when.get("below")
-        if action not in VALID_ACTIONS or not metric or below is None:
+        if action not in VALID_ACTIONS:
+            drop(index, raw, f"'then' must be one of {sorted(VALID_ACTIONS)}, got {raw.get('then')!r}")
+            continue
+        if metric not in KNOWN_METRICS:
+            drop(index, raw, f"metric must be one of {list(KNOWN_METRICS)}, got {when.get('metric')!r}")
+            continue
+        reason = _ineligible_reason(metric)
+        if reason:
+            drop(index, raw, reason)
+            continue
+        if below is None:
+            drop(index, raw, "'below' is required")
             continue
         try:
             below = float(below)
             for_steps = max(1, int(when.get("for_steps", 1)))
+            max_fires = None if action == ACTION_HALT else max(1, int(raw.get("max_fires", DEFAULT_MAX_FIRES)))
         except (TypeError, ValueError):
+            drop(index, raw, "'below', 'for_steps' and 'max_fires' must be numbers")
             continue
 
         out.append({
@@ -163,12 +207,7 @@ def normalise_policies(policies: Any) -> list[dict]:
             "below": below,
             "for_steps": for_steps,
             "action": action,
-            # Halt is terminal, so its budget is irrelevant; everything else is
-            # capped to make a runaway impossible.
-            "max_fires": (
-                None if action == ACTION_HALT
-                else max(1, int(raw.get("max_fires", DEFAULT_MAX_FIRES)))
-            ),
+            "max_fires": max_fires,
             "label": raw.get("label"),
         })
     return out
@@ -181,8 +220,15 @@ class PolicyEngine:
     relationships across steps rather than properties of one.
     """
 
-    def __init__(self, policies: Any = None, tool_policy: Optional[dict] = None):
-        self.policies = normalise_policies(policies)
+    def __init__(self, policies: Optional[Any] = None, tool_policy: Optional[dict] = None):
+        self.dropped_policies: list[dict] = []
+        self.policies = normalise_policies(policies, self.dropped_policies)
+        if self.dropped_policies:
+            import logging
+            logging.getLogger("hb_eval_sdk.policy").warning(
+                "HB-Eval: %d of %d policy rule(s) were rejected and will NOT protect this run: %s",
+                len(self.dropped_policies), len(policies) if isinstance(policies, (list, tuple)) else 1,
+                "; ".join(f"#{d['index']}: {d['reason']}" for d in self.dropped_policies))
         self._runs: dict[str, int] = {}        # policy key -> consecutive breach steps
         self._fires: dict[str, int] = {}       # policy key -> times fired
         self.directives: list[Directive] = []
@@ -256,6 +302,7 @@ class PolicyEngine:
 
     @property
     def tool_states(self) -> dict:
+        """A copy of every tool's circuit-breaker state, keyed by tool name."""
         return {t: dict(st) for t, st in self._tools.items()}
 
     # ── Policy evaluation ───────────────────────────────────────────────────
@@ -345,8 +392,10 @@ class PolicyEngine:
         return self._pending
 
     def summary(self) -> dict:
+        """A summary for the session: how many rules are active, the rules that were dropped and why, every directive issued, and counts by action."""
         return {
             "policies": len(self.policies),
+            "dropped_policies": list(self.dropped_policies),
             "directives": [d.as_dict() for d in self.directives],
             "actions_taken": {
                 a: sum(1 for d in self.directives if d.action == a)

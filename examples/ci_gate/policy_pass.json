@@ -1,0 +1,10 @@
+{
+  "conditions": [
+    {
+      "comparator": "gte",
+      "metric_name": "frr",
+      "threshold": 0.8
+    }
+  ],
+  "policy_version": "example-v1"
+}
