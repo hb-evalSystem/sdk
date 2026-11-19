@@ -9,6 +9,25 @@ Runs the fault-injection battery against an agent, compares the result to a
 threshold or a stored baseline, writes a report, and exits non-zero when the
 gate fails.
 
+CLI SCOPE - decided by the Phase 9B CLI integration audit
+---------------------------------------------------------
+The CLI covers the DECISION SURFACE only:
+
+    Baseline A + Baseline B  ->  Decision  ->  exit code
+
+Attestation (Phase 7), context assessment (Phase 8) and durable evidence
+(Phase 9B) are LIBRARY APIs, reached from Python, not from this command:
+
+    from hb_eval_sdk.attestation import attest
+    from hb_eval_sdk.context_assessment import assess_context
+    from hb_eval_sdk.evidence_store import store_evidence, load_evidence
+
+That is a deliberate boundary, not an omission. It is recorded here because
+a CLI that printed "attestation generated" or "evidence persisted" without
+having done either would be the same class of defect as DW-028: a claim
+travelling without the work that would justify it. This command makes no
+such claim, and must not begin to.
+
 THE PROBLEM THIS DESIGN IS SHAPED AROUND
 -----------------------------------------
 A flaky gate is worse than no gate.
@@ -60,12 +79,23 @@ EXIT_OK = 0
 EXIT_GATE_FAILED = 1
 EXIT_CONFIG_ERROR = 2
 
+# PHASE 6. Two NEW codes for two states the legacy gate could not express.
+# 0, 1 and 2 keep their published meanings exactly: redefining CONFIG_ERROR
+# to carry INCONCLUSIVE would make an unusable comparison indistinguishable
+# from a broken invocation, which is the confusion this phase exists to end.
+#
+# A pipeline branching on zero-vs-nonzero is unaffected. A pipeline that
+# distinguishes 1 from 2 now sees 3 and 4 as new values, never as a changed
+# meaning of an old one.
+EXIT_INCONCLUSIVE = 3
+EXIT_RECERTIFICATION_REQUIRED = 4
+
 # Metric ceilings, for rendering. TI is 0–5; the rest are 0–1.
 METRIC_MAX = {"pei": 1.0, "frr": 1.0, "irs": 1.0, "ti": 5.0, "csi": 1.0}
 METRIC_NAMES = {
     "pei": "Planning Efficiency",
     "frr": "Failure Resilience",
-    "irs": "Deliberate Handling",
+    "irs": "Intentional Recovery Score",
     "ti": "Traceability",
     "csi": "Consistency Stability",
 }
@@ -124,6 +154,7 @@ def load_task(path: str) -> dict:
 # ── Evaluation ──────────────────────────────────────────────────────────────
 def evaluate(agent: Callable, task: dict, *, n_scenarios: int,
              seed: Optional[int]) -> dict:
+    """Run the fault-injection battery against `agent` through the Gateway and return the report. Reads HBEVAL_API_KEY, HBEVAL_AES_KEY and HBEVAL_SIGNING_SECRET from the environment, and raises RuntimeError naming (never revealing) any that are missing."""
     from .client import HBEvalClient
 
     creds = {k: os.environ.get(k, "") for k in
@@ -181,6 +212,12 @@ def check(report: dict, *, floors: dict, baseline: Optional[dict],
             # a failure would block every pull request forever.
             notes.append(f"{metric.upper()} undefined — floor not applied")
             continue
+        if not _is_number(value):
+            # Fail closed. A floor silently skipped because the value was malformed would turn a
+            # broken response into a pass; an exception here would exit 1, which is the code for
+            # "the gate failed", disguising a crash as a verdict.
+            failures.append(f"{metric.upper()} came back as {value!r}, not a number — cannot apply the floor {floor}")
+            continue
         if value < floor:
             failures.append(
                 f"{metric.upper()} {value:.3f} is below the floor {floor}")
@@ -191,18 +228,30 @@ def check(report: dict, *, floors: dict, baseline: Optional[dict],
                         or baseline.get("aggregate_metrics") or {})
         for metric, value in metrics.items():
             prev = base_metrics.get(metric)
-            if value is None or prev is None:
+            if not _is_number(value) or not _is_number(prev):
                 continue
-            drop = prev - value
-            if drop > max_regression:
-                failures.append(
-                    f"{metric.upper()} fell {drop:.3f} from the baseline "
-                    f"({prev:.3f} → {value:.3f}), beyond the {max_regression} "
-                    f"tolerance")
-            elif drop > 0:
+            # PHASE 6 (DW-028). The raw subtraction that stood here produced
+            # a reliability FAIL from two dictionaries of numbers, with no
+            # comparability, no metric_version, no provenance, no battery
+            # identity and no baseline eligibility checked. Two reports from
+            # different batteries, slots, scoring versions or judges compared
+            # cleanly and blocked a pull request.
+            #
+            # A reliability verdict is now the decision layer's to make.
+            # This module translates a verdict; it never makes one.
+            #
+            # What remains is an OBSERVATION, not a decision: the numbers are
+            # reported so a reader can see them, and nothing follows from
+            # them. "regression" is deliberately absent - a difference is not
+            # a regression without attribution conditions this system cannot
+            # meet (DW-015), and direction is not derivable without metric
+            # polarity (DW-027).
+            difference = value - prev
+            if difference != 0:
                 notes.append(
                     f"{metric.upper()} {prev:.3f} → {value:.3f} "
-                    f"(within tolerance)")
+                    f"(observed difference {difference:+.3f}; not a "
+                    f"reliability verdict)")
 
     return not failures, failures, notes
 
@@ -211,6 +260,7 @@ def check(report: dict, *, floors: dict, baseline: Optional[dict],
 def render_markdown(report: dict, passed: bool, failures: list, notes: list,
                     *, floors: dict, baseline: Optional[dict],
                     enforce: bool) -> str:
+    """Render the gate result as GitHub-flavoured Markdown for the job summary: the outcome, the metrics against their floors and baseline, and, in warn mode, what would have blocked."""
     metrics = report.get("metrics") or report.get("aggregate_metrics") or {}
     base_metrics = ((baseline or {}).get("metrics")
                     or (baseline or {}).get("aggregate_metrics") or {})
@@ -283,6 +333,15 @@ def render_markdown(report: dict, passed: bool, failures: list, notes: list,
     return "\n".join(lines)
 
 
+def _escape_command_data(text) -> str:
+    """Escape text for the data part of a GitHub Actions workflow command (`::level::data`)."""
+    return (str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value  # NaN != NaN
+
+
 def emit_github(markdown: str, failures: list, enforce: bool) -> None:
     """Write the GitHub Actions job summary and annotations.
 
@@ -300,12 +359,151 @@ def emit_github(markdown: str, failures: list, enforce: bool) -> None:
         level = "error" if enforce else "warning"
         for f in failures:
             # Annotations surface on the pull request itself, where the person
-            # who needs them is already looking.
-            print(f"::{level} title=HB-Eval reliability gate::{f}")
+            # who needs them is already looking. The text is escaped per the workflow-command
+            # rules: an unescaped newline would let a failure message start a command of its own.
+            print(f"::{level} title=HB-Eval reliability gate::{_escape_command_data(f)}")
 
 
 # ── Command ─────────────────────────────────────────────────────────────────
+def run_reliability_decision(args):
+    """The authoritative path: load artefacts, call the 5D chain, translate.
+
+    ORCHESTRATION ONLY. This function loads files and renders a result. Every
+    scientific step belongs to a module that already owns it:
+
+        ReliabilityBaseline.from_dict   5D-B   reconstructs and verifies
+        diff_baselines                  5D-D   which itself calls 5D-C
+        decide                          6      evaluates the declared policy
+
+    What this function must never do, and does not: subtract two metric
+    values, reconstruct comparability, infer metric polarity, invent a
+    threshold.
+
+    Returns (exit_code, decision), or (exit_code, None) on a load error.
+    """
+    from .baseline import ReliabilityBaseline
+    from .reliability_diff import diff_baselines
+    from .reliability_decision import (decide, DecisionState, SLOPolicy,
+                                       SLOCondition)
+
+    def _load(path, what):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            _err(f"could not read the {what} at {path}: {exc}")
+            return None
+
+    ref_raw = _load(args.reference_baseline, "reference baseline")
+    cand_raw = _load(args.candidate_baseline, "candidate baseline")
+    if ref_raw is None or cand_raw is None:
+        return EXIT_CONFIG_ERROR, None
+
+    # from_dict verifies the stored hash. A baseline that does not round-trip
+    # is a configuration problem, not an inconclusive comparison: the input is
+    # broken, and INCONCLUSIVE would blame the evidence instead.
+    try:
+        reference = ReliabilityBaseline.from_dict(ref_raw)
+        candidate = ReliabilityBaseline.from_dict(cand_raw)
+    except Exception as exc:
+        _err(f"a baseline did not verify: {exc}")
+        return EXIT_CONFIG_ERROR, None
+
+    policy = None
+    if args.slo_policy:
+        raw = _load(args.slo_policy, "SLO policy")
+        if raw is None:
+            return EXIT_CONFIG_ERROR, None
+        try:
+            policy = SLOPolicy(
+                policy_version=raw["policy_version"],
+                policy_id=raw.get("policy_id"),
+                conditions=tuple(
+                    SLOCondition(
+                        metric_name=c["metric_name"],
+                        comparator=c["comparator"],
+                        threshold=float(c["threshold"]),
+                        applies_to=c.get("applies_to", "value_b"),
+                        decision_eligible=c.get("decision_eligible", True))
+                    for c in raw.get("conditions", [])))
+        except (KeyError, TypeError, ValueError) as exc:
+            _err(f"the SLO policy is malformed: {exc}")
+            return EXIT_CONFIG_ERROR, None
+
+    diff = diff_baselines(reference, candidate)
+    decision = decide(diff, policy)
+
+    print(f"\nReliability decision: {decision.state}")
+    print(f"  comparability: {decision.comparability_state}")
+    if decision.policy_version:
+        print(f"  policy: {decision.policy_version}")
+    for reason in decision.reasons:
+        print(f"  - {reason}")
+    for name in sorted(decision.per_metric):
+        md = decision.per_metric[name]
+        print(f"  {METRIC_NAMES.get(name, name.upper())}: {md.state}")
+        for r in md.reasons:
+            print(f"      {r}")
+
+    # TRANSLATION, not decision. One-to-one, adding no judgement of its own.
+    mapping = {
+        DecisionState.PASS: EXIT_OK,
+        DecisionState.FAIL: EXIT_GATE_FAILED,
+        DecisionState.INCONCLUSIVE: EXIT_INCONCLUSIVE,
+        DecisionState.RECERTIFICATION_REQUIRED:
+            EXIT_RECERTIFICATION_REQUIRED,
+    }
+    code = mapping[decision.state]
+
+    # --enforce keeps its published meaning: without it, nothing blocks.
+    if code != EXIT_OK and not args.enforce:
+        print("\nWarn mode — not blocking. Add --enforce to make this fail.")
+        return EXIT_OK, decision
+
+    return code, decision
+
+
 def run_gate(args: argparse.Namespace) -> int:
+    # ── PHASE 6 ROUTING ──────────────────────────────────────────────
+    #
+    # Two paths, chosen by which inputs were supplied, never by guessing:
+    #
+    #   --reference-baseline + --candidate-baseline
+    #       the AUTHORITATIVE reliability decision path (Phase 6)
+    #
+    #   --baseline
+    #       the LEGACY compatibility path. It reports observed differences
+    #       and makes no reliability claim. Kept so existing pipelines keep
+    #       working; not authoritative for anything.
+    #
+    # Supplying only one of the pair is a configuration error, not a silent
+    # fallback to the legacy path: a caller who asked for the authoritative
+    # decision must not be quietly given the legacy one instead.
+    """Run the gate and return its exit code.
+
+    0: passed, or failed in warn mode. 1: the gate failed under --enforce. 2: usage or configuration
+    error (a missing credential is not a reliability failure). 3: the evidence was inconclusive.
+    4: recertification is required. Routing is decided by which inputs were given, never guessed:
+    two baselines select the authoritative decision path; an agent and a task select the live battery.
+    """
+    ref = getattr(args, "reference_baseline", None)
+    cand = getattr(args, "candidate_baseline", None)
+    if ref or cand:
+        if not (ref and cand):
+            _err("--reference-baseline and --candidate-baseline must be "
+                 "supplied together; the CLI evaluation path produces no "
+                 "evidence envelopes and cannot derive the missing one")
+            return EXIT_CONFIG_ERROR
+        code, _decision = run_reliability_decision(args)
+        return code
+
+    # Argparse no longer demands these (the authoritative path needs neither), so the
+    # legacy path must: a missing one is a usage error (2), exactly as before.
+    if not getattr(args, "agent", None) or not getattr(args, "task", None):
+        _err("--agent and --task are required unless --reference-baseline and "
+             "--candidate-baseline are given")
+        return EXIT_CONFIG_ERROR
+
     try:
         agent = load_agent(args.agent)
         task = load_task(args.task)
@@ -383,6 +581,7 @@ def run_gate(args: argparse.Namespace) -> int:
 
 
 def add_parser(subparsers) -> None:
+    """Register the `gate` subcommand and its options on an argparse subparsers object."""
     p = subparsers.add_parser(
         "gate",
         help="Run the reliability battery as a CI gate.",
@@ -392,10 +591,12 @@ def add_parser(subparsers) -> None:
             "Warns without blocking unless --enforce is given."
         ),
     )
-    p.add_argument("--agent", required=True,
-                   help="Agent callable as 'module.path:attribute'.")
-    p.add_argument("--task", required=True,
-                   help="JSON file with 'system' and 'question'.")
+    p.add_argument("--agent", default=None,
+                   help="Agent callable as 'module.path:attribute'. Required unless "
+                        "--reference-baseline and --candidate-baseline are given.")
+    p.add_argument("--task", default=None,
+                   help="JSON file with 'system' and 'question'. Required unless "
+                        "--reference-baseline and --candidate-baseline are given.")
     p.add_argument("--scenarios", type=int, default=18,
                    help="Battery size, 6–60. Default 18.")
     p.add_argument("--seed", type=int, default=42,
@@ -408,6 +609,28 @@ def add_parser(subparsers) -> None:
     for metric in ("pei", "frr", "irs", "ti", "csi"):
         p.add_argument(f"--min-{metric}", type=float, default=None,
                        help=f"Minimum acceptable {metric.upper()}.")
+
+    # ── PHASE 6: the authoritative reliability decision path ─────────
+    #
+    # NEW flags rather than a changed meaning for --baseline. Silently
+    # repointing --baseline from a raw metric report to a ReliabilityBaseline
+    # would break every pipeline that already passes one, and would blur the
+    # legacy compatibility path into the authoritative one - which is exactly
+    # the confusion Phase 6 exists to end.
+    #
+    # Both baselines must be supplied: gate.evaluate() runs a local battery
+    # that produces no evidence envelopes, so the CLI cannot derive a
+    # ReliabilityBaseline for the candidate on its own. That is a real
+    # limitation of the CLI evaluation path, stated rather than worked around.
+    p.add_argument("--reference-baseline", metavar="PATH",
+                   help="Serialised ReliabilityBaseline to compare against. "
+                        "Enables the authoritative decision path.")
+    p.add_argument("--candidate-baseline", metavar="PATH",
+                   help="Serialised ReliabilityBaseline for the candidate. "
+                        "Required with --reference-baseline.")
+    p.add_argument("--slo-policy", metavar="PATH",
+                   help="Declared, versioned SLO policy. Without one no PASS "
+                        "or FAIL is possible.")
 
     p.add_argument("--baseline",
                    help="JSON report to compare against. Missing file is fine "

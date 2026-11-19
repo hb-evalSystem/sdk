@@ -49,17 +49,42 @@ Run:      python -m hb_eval_sdk.mcp_server
 """
 from __future__ import annotations
 
+import dataclasses
+import enum
+import ipaddress
 import json
 import os
 from typing import Any, Optional
+from urllib.parse import urlparse
 
+# The MCP Python SDK renamed its server class between major versions: mcp 1.x ships
+# `mcp.server.fastmcp.FastMCP`, mcp 2.x ships `mcp.server.mcpserver.MCPServer`. The surface this
+# file uses (constructor(name), .tool(name=, description=), .run()) is the same in both, so
+# either is accepted. Without this shim `pip install hb-eval-sdk[mcp]` broke on a fresh install
+# the moment mcp 2 was released, and the error blamed a package that was in fact installed.
 try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError as exc:  # pragma: no cover
+    import mcp as _mcp_pkg  # noqa: F401
+except ImportError as exc:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "The MCP server requires the 'mcp' package. Install with:\n"
+        "The MCP server requires the 'mcp' package (Python >= 3.10). Install with:\n"
         "    pip install hb-eval-sdk[mcp]"
     ) from exc
+
+try:
+    from mcp.server.mcpserver import MCPServer as FastMCP          # mcp >= 2
+except ImportError:
+    try:
+        from mcp.server.fastmcp import FastMCP  # type: ignore[attr-defined,import-not-found,no-redef]                      # mcp 1.x
+    except ImportError as exc:  # pragma: no cover
+        import importlib.metadata as _md
+        try:
+            _found = _md.version("mcp")
+        except Exception:
+            _found = "unknown"
+        raise ImportError(
+            f"Installed mcp {_found} provides neither mcp.server.mcpserver.MCPServer (mcp 2.x) nor "
+            "mcp.server.fastmcp.FastMCP (mcp 1.x). Install a supported version: pip install 'mcp>=1.2,<3'"
+        ) from exc
 
 from .client import HBEvalClient
 from .exceptions import HBEvalError
@@ -104,13 +129,68 @@ def _load_client() -> HBEvalClient:
     return HBEvalClient(**kwargs)
 
 
+def _json_default(obj: Any) -> Any:
+    """Serialise the typed objects the SDK returns (pydantic models, dataclasses, enums).
+    Anything else is refused rather than stringified, so internals cannot leak by accident."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return dataclasses.asdict(obj)
+    if isinstance(obj, enum.Enum):
+        return obj.value
+    if isinstance(obj, (set, frozenset, tuple)):
+        return list(obj)
+    raise TypeError(f"not JSON serialisable: {type(obj).__name__}")
+
+
 def _err(message: str) -> str:
     """Uniform, safe error payload. Never leaks credentials or stack traces."""
     return json.dumps({"ok": False, "error": message}, ensure_ascii=False, indent=2)
 
 
 def _ok(data: Any) -> str:
-    return json.dumps({"ok": True, "result": data}, ensure_ascii=False, indent=2)
+    return json.dumps({"ok": True, "result": data}, ensure_ascii=False, indent=2, default=_json_default)
+
+
+def _text(value: Any, name: str) -> Optional[str]:
+    """Error message if `value` is not a non-empty string, else None."""
+    if not isinstance(value, str) or not value.strip():
+        return f"{name} must be a non-empty string."
+    return None
+
+
+def _bounded_int(value: Any, name: str, lo: int, hi: int) -> Optional[str]:
+    if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
+        return f"{name} must be an integer between {lo} and {hi}."
+    return None
+
+
+_PRIVATE_SUFFIXES = (".local", ".internal", ".localhost", ".lan", ".corp", ".home")
+
+
+def _check_public_https(url: Any, label: str) -> Optional[str]:
+    """First-line filter for an agent URL: https, a real host, no embedded credentials, and
+    not an obviously internal address. The Gateway performs the authoritative SSRF check
+    (including DNS resolution); this only refuses the clearly wrong input early, so an
+    assistant cannot be talked into pointing the platform at localhost or a metadata IP."""
+    if not isinstance(url, str) or not url.strip():
+        return f"{label} must be a public HTTPS endpoint."
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return f"{label} must be a public HTTPS endpoint."
+    if parsed.username or parsed.password:
+        return f"{label} must not embed credentials."
+    if host == "localhost" or host.endswith(_PRIVATE_SUFFIXES):
+        return f"{label} must be a public HTTPS endpoint, not an internal host."
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None                                      # a DNS name: the Gateway resolves and checks it
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified):
+        return f"{label} must be a public HTTPS endpoint, not an internal address."
+    return None
 
 
 # ── Tool 1: evaluate an agent's reliability (the core) ──────────────────────
@@ -150,11 +230,16 @@ def evaluate_agent_reliability(
             "Consent required. The verified path calls your agent endpoint across "
             "multiple fault scenarios. Re-run with consent=true to proceed."
         )
-    if not agent_url.lower().startswith("https://"):
-        return _err("agent_url must be a public HTTPS endpoint.")
+    problem = (_check_public_https(agent_url, "agent_url") or _text(task_description, "task_description")
+               or _bounded_int(n_scenarios, "n_scenarios", 1, 100))
+    if problem:
+        return _err(problem)
+    if required_in_response is not None and not (
+            isinstance(required_in_response, list) and all(isinstance(k, str) for k in required_in_response)):
+        return _err("required_in_response must be a list of strings.")
     try:
         client = _load_client()
-        base_task = {"question": task_description}
+        base_task: dict = {"question": task_description}
         if required_in_response:
             base_task["required_in_response"] = required_in_response
         report = client.request_verified_evaluation(
@@ -252,8 +337,10 @@ def retrieve_qualified_memory(context: str, top_k: int = 5) -> str:
     tool passes the request through unchanged and does not itself decide the
     limit, so the plan boundary stays in one place.
     """
-    if not context.strip():
+    if _text(context, "context"):
         return _err("A non-empty context is required to retrieve memory.")
+    if _bounded_int(top_k, "top_k", 1, 50):
+        return _err("top_k must be an integer between 1 and 50.")
     try:
         client = _load_client()
         memories = client.retrieve_memory(context=context, top_k=top_k)
@@ -284,7 +371,7 @@ def explain_verdict(plan_summary: str) -> str:
     uncertainty response — deferring to a human when no qualified precedent
     exists — is produced by the core, not synthesised here.
     """
-    if not plan_summary.strip():
+    if _text(plan_summary, "plan_summary"):
         return _err("A non-empty plan_summary is required to explain a verdict.")
     try:
         client = _load_client()
@@ -322,8 +409,12 @@ def compare_reliability(
             "battery. Re-run with consent=true to proceed."
         )
     for label, url in (("agent_a_url", agent_a_url), ("agent_b_url", agent_b_url)):
-        if not url.lower().startswith("https://"):
-            return _err(f"{label} must be a public HTTPS endpoint.")
+        problem = _check_public_https(url, label)
+        if problem:
+            return _err(problem)
+    problem = _text(task_description, "task_description") or _bounded_int(n_scenarios, "n_scenarios", 1, 100)
+    if problem:
+        return _err(problem)
     try:
         client = _load_client()
         base_task = {"question": task_description}
@@ -378,8 +469,10 @@ def get_reliability_trend(agent_id: str, window: int = 20) -> str:
     Delegates to the SDK if a trend/history method is available; otherwise
     returns a clear message rather than fabricating a trend.
     """
-    if not agent_id.strip():
+    if _text(agent_id, "agent_id"):
         return _err("A non-empty agent_id is required.")
+    if _bounded_int(window, "window", 1, 1000):
+        return _err("window must be an integer between 1 and 1000.")
     try:
         client = _load_client()
         trend = client.get_trend(agent_id=agent_id, window=window)

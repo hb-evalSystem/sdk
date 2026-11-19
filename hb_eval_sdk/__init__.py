@@ -37,48 +37,59 @@ from .exceptions import (
 # Runtime monitoring is part of the core SDK (no third-party dependency).
 from .monitoring import MonitorSession, DEFAULT_THRESHOLDS
 
-# Framework integrations are optional: each needs its own third-party package.
-# They are imported defensively so the core SDK keeps working for users who
-# have installed none of them. Missing names resolve to None rather than
-# raising at import time.
-try:
-    from .langchain_integration import adapt_langchain_agent, HBEvalLangChainCallback
+# Framework integrations are LAZY. Each integration module is plain Python that talks to its
+# framework by duck typing, so importing one never requires the framework; the names below are
+# resolved on first access (PEP 562) instead of at `import hb_eval_sdk`. Eager imports made every
+# user of the core SDK pay for LangChain/LangGraph/CrewAI whether or not they used them (LangChain's
+# callback base class alone cost ~200 ms), and a broken framework install could break an unrelated
+# `import hb_eval_sdk`. A framework is needed only when you call into it.
+_LAZY_ATTRIBUTES = {
+    "adapt_langchain_agent": ("langchain_integration", "adapt_langchain_agent"),
+    "HBEvalLangChainCallback": ("langchain_integration", "HBEvalLangChainCallback"),
     # Backwards-compatible alias: HBEvalCallback was the name in <=2.2.0.
-    HBEvalCallback = HBEvalLangChainCallback
-    _HAS_LANGCHAIN = True
-except Exception:  # pragma: no cover
-    adapt_langchain_agent = None
-    HBEvalLangChainCallback = None
-    HBEvalCallback = None
-    _HAS_LANGCHAIN = False
+    "HBEvalCallback": ("langchain_integration", "HBEvalLangChainCallback"),
+    "adapt_langgraph_agent": ("langgraph_integration", "adapt_langgraph_agent"),
+    "adapt_langgraph_node": ("langgraph_integration", "adapt_langgraph_node"),
+    "adapt_crewai_agent": ("crewai_integration", "adapt_crewai_agent"),
+    "adapt_crewai_crew": ("crewai_integration", "adapt_crewai_crew"),
+    "HBEvalCrewObserver": ("crewai_integration", "HBEvalCrewObserver"),
+}
 
-try:
-    from .langgraph_integration import adapt_langgraph_agent, adapt_langgraph_node
-    _HAS_LANGGRAPH = True
-except Exception:  # pragma: no cover
-    adapt_langgraph_agent = None
-    adapt_langgraph_node = None
-    _HAS_LANGGRAPH = False
+# Submodules that are part of the public API. Each defines its own `__all__`, which IS the supported
+# surface of that module; anything underscore-prefixed or not listed there is private. They are
+# reached as `hb_eval_sdk.enrollment` or `from hb_eval_sdk import enrollment` and are deliberately NOT
+# flattened into this namespace: several export the same short names (for example `Decision` in both
+# `enforcement` and `enforcement_contract`), and a flat namespace would make one silently shadow another.
+PUBLIC_SUBMODULES = (
+    "policy_document", "topology", "lineage", "readiness_passport", "enrollment", "operational",
+    "operational_passport", "enforcement", "enforcement_evidence", "assurance",
+    "protocol", "gate", "faults", "evidence", "monitoring", "policy", "contracts", "configuration",
+    "validation", "battery", "attestation",
+)
 
-try:
-    from .crewai_integration import (
-        adapt_crewai_agent,
-        adapt_crewai_crew,
-        HBEvalCrewObserver,
-    )
-    _HAS_CREWAI = True
-except Exception:  # pragma: no cover
-    adapt_crewai_agent = None
-    adapt_crewai_crew = None
-    HBEvalCrewObserver = None
-    _HAS_CREWAI = False
+
+def __getattr__(name):
+    import importlib
+    if name in _LAZY_ATTRIBUTES:
+        module, attribute = _LAZY_ATTRIBUTES[name]
+        value = getattr(importlib.import_module(f".{module}", __name__), attribute)
+        globals()[name] = value           # resolve once
+        return value
+    if name in PUBLIC_SUBMODULES:
+        return importlib.import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_ATTRIBUTES) | set(PUBLIC_SUBMODULES))
+
 
 # The MCP server is NOT imported here. It requires the optional `mcp` package
 # and is a standalone entry point (python -m hb_eval_sdk.mcp_server); importing
 # it eagerly would make every `import hb_eval_sdk` pay for a dependency that
 # most users of the library itself do not need.
 
-__version__ = "2.11.0"
+__version__ = "2.13.0"
 
 # ── Real runtime fault injection (new in 2.11.0) ───────────────────────
 #
@@ -107,7 +118,7 @@ try:
     from .evidence import FaultEvent, InjectionStatus, ObservedOutcome
     _FAULT_INJECTION_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    fault_context = None
+    fault_context = None  # type: ignore[assignment]
     _FAULT_INJECTION_AVAILABLE = False
 
 __all__ = [
@@ -115,7 +126,7 @@ __all__ = [
     # runtime monitoring
     "MonitorSession",
     "DEFAULT_THRESHOLDS",
-    # framework integrations (None when the framework is not installed)
+    # framework integrations (lazy: resolved on first access, never at import)
     "adapt_langchain_agent",
     "HBEvalLangChainCallback",
     "HBEvalCallback",
@@ -124,6 +135,7 @@ __all__ = [
     "adapt_crewai_agent",
     "adapt_crewai_crew",
     "HBEvalCrewObserver",
+    "PUBLIC_SUBMODULES",
     "EvaluationResult",
     "MemoryMatch",
     "Metrics",

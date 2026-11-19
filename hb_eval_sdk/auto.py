@@ -77,10 +77,10 @@ def _halt_policy_from_env() -> Optional[dict]:
         return None
 
 
-def instrument(client: Any = None, *, agent_id: Optional[str] = None,
+def instrument(client: Optional[Any] = None, *, agent_id: Optional[str] = None,
                halt_policy: Optional[dict] = None,
-               tracer_provider: Any = None,
-               on_threshold_breach: Any = None,
+               tracer_provider: Optional[Any] = None,
+               on_threshold_breach: Optional[Any] = None,
                thresholds: Optional[dict] = None,
                stream: bool = True):
     """Attach HB-Eval to a tracer provider. Returns the processor, or None.
@@ -113,8 +113,17 @@ def instrument(client: Any = None, *, agent_id: Optional[str] = None,
             )
             return None
         from .client import HBEvalClient
-        client = HBEvalClient(api_key=api_key, aes_key=aes_key,
-                              signing_secret=signing)
+        try:
+            client = HBEvalClient(api_key=api_key, aes_key=aes_key,
+                                  signing_secret=signing)
+        except Exception as exc:
+            # Malformed credentials (bad base64, a short key, an http gateway URL) must degrade to
+            # "no monitoring", exactly like missing ones. Raising here would fail the importing
+            # application's startup, which is the one thing this module promises never to do.
+            # Only the exception TYPE and message are logged; the client never puts secrets in them.
+            logger.warning("HB-Eval: credentials in the environment are not usable (%s: %s). "
+                           "Monitoring is disabled.", type(exc).__name__, exc)
+            return None
 
     try:
         from .otel_bridge import build_processor
@@ -128,6 +137,10 @@ def instrument(client: Any = None, *, agent_id: Optional[str] = None,
         )
     except ImportError as exc:
         logger.warning("HB-Eval: %s", exc)
+        return None
+    except Exception as exc:        # a bad halt policy, bad thresholds: still never a failed startup
+        logger.warning("HB-Eval: could not build the OpenTelemetry processor (%s: %s). "
+                       "Monitoring is disabled.", type(exc).__name__, exc)
         return None
 
     try:

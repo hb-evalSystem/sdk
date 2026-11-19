@@ -1,0 +1,41 @@
+{
+  "protocol_version": "2.8.0",
+  "spec": "docs/PROTOCOL.md sections 2-4",
+  "note": "Generated with the cryptography library and hmac directly, independent of hb_eval_sdk. An implementation conforms if, given aes_key and signing_secret, it reproduces ciphertext_hex and signature_hex for each case, and rejects any single-byte change to ciphertext_hex.",
+  "aes_key_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "signing_secret_b64": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+  "cases": [
+    {
+      "name": "minimal",
+      "plaintext": "{\"a\": 1}",
+      "nonce_hex": "000102030405060708090a0b",
+      "timestamp": "1700000000",
+      "ciphertext_hex": "3c20b739ffc5f3669021682067b34db20e544269ebb34654",
+      "signature_hex": "d6c74e3705e5224f4c053feaf19f9ed9303ca81943023dfaa3d33c7112a3b8f7"
+    },
+    {
+      "name": "unicode",
+      "plaintext": "{\"note\": \"caf\\u00e9 \\u2713\"}",
+      "nonce_hex": "000102030405060708090a0b",
+      "timestamp": "1700000000",
+      "ciphertext_hex": "3c20b874b180e021ad63f4ead7b50d5db3b3be14ac0e6d4b0954c7f8600528a7fdceb489c676d55764e46073",
+      "signature_hex": "acf3cd4ea21fce4130bbbc09e4d4b8c0c41ab8e0c12dc2d619455d9e6d8a32fb"
+    },
+    {
+      "name": "empty_object",
+      "plaintext": "{}",
+      "nonce_hex": "000102030405060708090a0b",
+      "timestamp": "1700000000",
+      "ciphertext_hex": "3c7f95df86920d3d6001cfa979b4b0b5d9da",
+      "signature_hex": "37374802500c78721e03a1e1d5158d4cd7261827426abccddc834f41acc7723a"
+    }
+  ],
+  "negative": {
+    "description": "signature_hex for case 'minimal' must NOT validate if any of nonce, timestamp or ciphertext changes",
+    "mutations": [
+      "nonce_hex",
+      "timestamp",
+      "ciphertext_hex"
+    ]
+  }
+}

@@ -19,10 +19,11 @@ before the damage lands.
 ## Install
 
 ```bash
-pip install hb-eval-sdk==2.9.0
+pip install hb-eval-sdk
+pip install .                      # this tree: 2.13.0
 ```
 
-Python 3.10+. Three dependencies: `requests`, `cryptography`, `pydantic`.
+Python >=3.9 is declared; this tree has been run on 3.12 only. Three dependencies: `requests`, `cryptography`, `pydantic`.
 
 ---
 
@@ -218,16 +219,54 @@ are not directly comparable, and every report carries its scoring version.
 
 ---
 
+## From a measurement to production assurance (new in 2.13)
+Measuring an agent is the first step. 2.13 adds the layers that carry a decision into production and keep checking
+it, each consuming the previous one and **adding no score of its own**:
+
+`policy_document` → `topology` → `lineage` → `readiness_passport` → `enrollment` → `operational` →
+`operational_passport` → `enforcement` → `enforcement_evidence` → `assurance`
+
+Every artefact is content-addressed, so `verify()` tells you whether it was altered after it was made. The final
+layer returns a required *action* (continue, alert, enforce, re-evaluate), never a verdict or a grade. Import the
+layers by name (`from hb_eval_sdk import enrollment`); each module's `__all__` is its public API.
+
+- **[User guide](docs/USER_GUIDE.md)**: every code block in it is executed by the test suite.
+- **[`examples/lifecycle.py`](examples/lifecycle.py)**: the whole chain end to end, offline: `python examples/lifecycle.py`.
+- **[API stability](docs/API_STABILITY.md)**, **[wire protocol](docs/PROTOCOL.md)** and its conformance vectors
+  (`docs/protocol_vectors.json`), **[threat model](docs/THREAT_MODEL.md)**, **[SECURITY.md](SECURITY.md)**.
+
 ## CI gate
+Two ways to run it, depending on whether you want the network involved.
 
 ```yaml
-- uses: hb-evalSystem/hb-eval-sdk@v2.9.0
+# 1. Offline decision — no secrets, no network. Compares two stored baselines against an SLO policy.
+- uses: hb-evalSystem/hb-eval-sdk@v2.13.0
+  with:
+    reference-baseline: '.hbeval/reference.json'
+    candidate-baseline: '.hbeval/candidate.json'
+    slo-policy: '.hbeval/slo.json'
+    enforce: false      # start here
+
+# 2. Live battery against your agent — needs HBEVAL_API_KEY / HBEVAL_AES_KEY / HBEVAL_SIGNING_SECRET.
+- uses: hb-evalSystem/hb-eval-sdk@v2.13.0
+  env:
+    HBEVAL_API_KEY: ${{ secrets.HBEVAL_API_KEY }}
+    HBEVAL_AES_KEY: ${{ secrets.HBEVAL_AES_KEY }}
+    HBEVAL_SIGNING_SECRET: ${{ secrets.HBEVAL_SIGNING_SECRET }}
   with:
     agent: 'myapp.agent:run'
+    task: '.hbeval/task.json'
     baseline: '.hbeval/baseline.json'
-    enforce: false      # start here
+    enforce: false
 ```
+Exit codes (also the `exit-code` output): `0` pass or warn mode · `1` gate failed · `2` usage or
+configuration error (a missing credential is not a reliability failure) · `3` inconclusive evidence ·
+`4` recertification required. Try the offline form with no setup:
+`hb-eval gate --reference-baseline examples/ci_gate/ref.json --candidate-baseline examples/ci_gate/cand.json --slo-policy examples/ci_gate/policy_pass.json --enforce`.
+The action installs the SDK from its own checkout, so the tag you pin is the version that runs.
 
+> **Security:** `--agent module:callable` imports and runs your code. Never point the gate at code from an untrusted
+> pull request, and do not combine it with `pull_request_target` on code you have not reviewed.
 Start in warn mode. Agents built on language models vary between runs, and a
 gate that blocks on ordinary variance gets switched off within days — after
 which it protects nothing. Compare against your own baseline rather than an
@@ -249,7 +288,65 @@ no third-party audit, and makes no warranty about future behaviour.
 
 ---
 
+## The evidence chain
+
+New in 2.12.0. Eight layers between a measurement and an operational
+conclusion, each with a state that means **"I cannot say"**.
+
+```
+Evidence  ->  Baseline  ->  Comparability  ->  Diff  ->  Decision
+          ->  Attestation  ->  Context assessment  ->  Durable evidence
+```
+
+```python
+from hb_eval_sdk.baseline             import ReliabilityBaseline
+from hb_eval_sdk.comparability        import compare
+from hb_eval_sdk.reliability_diff     import diff_baselines
+from hb_eval_sdk.reliability_decision import decide, SLOPolicy, SLOCondition
+from hb_eval_sdk.attestation          import attest
+from hb_eval_sdk.context_assessment   import assess_context
+from hb_eval_sdk.evidence_store       import store_evidence, load_evidence
+```
+
+**Comparability before comparison.** Two evaluations are compared only when
+the measurement context permits it, decided per metric and for the pair:
+
+```python
+baseline = ReliabilityBaseline.from_envelope(envelope)
+verdict  = compare(baseline_a, baseline_b, identity_a, identity_b)
+# COMPARABLE | NOT_COMPARABLE | UNKNOWN
+```
+
+**A decision needs a declared policy.** There are no default thresholds in
+this SDK — they are organizational, and without one the verdict is
+`INCONCLUSIVE`:
+
+```python
+policy   = SLOPolicy("org-v1", (SLOCondition("frr", "gte", 0.80),))
+decision = decide(diff_baselines(baseline_a, baseline_b), policy)
+# PASS | FAIL | INCONCLUSIVE | RECERTIFICATION_REQUIRED
+```
+
+**Evidence that survives a process**, with a reload that verifies the bytes,
+the reconstruction and the canonical hash — and raises on any alteration:
+
+```python
+store_evidence(envelope, "evidence/run-42.json")
+restored = load_evidence("evidence/run-42.json")
+```
+
+The CLI covers the decision surface only. These are library APIs, reached
+from Python, which is a deliberate boundary rather than an omission.
+
+Read the [2.13.0 release notes](RELEASE_NOTES_v2.13.0.md) and the [2.12.0 notes](RELEASE_NOTES_v2.12.0.md) for the limits
+before relying on any of it — in particular that an attestation is not a
+certification, that persistence detects alteration but does not establish
+authorship, and that `CONTEXT_UNCHANGED` is not a statement of validity.
+
+---
+
 ## What this does not do
+
 
 - **It does not judge correctness.** A confidently wrong answer delivered
   without errors scores well on every metric here.

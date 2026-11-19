@@ -13,6 +13,269 @@ between SDK and Gateway, and does not move when the library does.
 
 ---
 
+## [2.13.0]
+
+### Added — from evidence to enrolment, enforcement and continuous assurance
+
+Ten modules on top of 2.12.0, in the order the specification builds them:
+`policy_document` (R1), `topology` (R2), `lineage` (R3), `readiness_passport`
+(R4), `enrollment` (R5), `operational` (R6), `operational_passport` (R7),
+`enforcement` (R8, SDK half), `enforcement_evidence` (R9), `assurance` (R10).
+
+### Changed
+- `attestation.py`: the DW-008 limitation no longer says the evidence schema
+  "is still moving" — it has been frozen since Phase 9A.
+- `__version__` now agrees with `pyproject.toml` (it said 2.11.0 in 2.12.0).
+
+### Protocol
+- `PROTOCOL_VERSION` (wire) 2.7.0 → **2.8.0**: additive enforcement surface only. It is now a
+  separate number from `MEASUREMENT_PROTOCOL_VERSION` (2.7.0), which stamps passports.
+- NEW `hb_eval_sdk.protocol`: the major.minor compatibility rule that `config.py` documented but
+  nothing enforced. The client now reads the Gateway's `X-HBEval-Protocol` response header once
+  and warns (`ProtocolMismatchWarning`) on a mismatch; a Gateway that does not advertise is
+  `unknown`, never `ok`.
+- NEW `docs/PROTOCOL.md`, reconstructed from the code both peers cite it from.
+
+### Added — CI/CD
+- `.github/workflows/ci.yml`: tests on Python 3.9–3.13; tests at the declared dependency floors;
+  conformance + mutation check; flake8 hard errors; bandit; pip-audit (3.12 clean, 3.9 with an
+  explicit allow-list); build + `twine check --strict` + clean-venv install + version agreement;
+  the gate action exercised end to end with no secrets.
+- `release.yml` (tag-driven, PyPI trusted publishing, build attestation, checksums), `codeql.yml`,
+  `dependabot.yml`. Third-party actions are pinned to commit SHAs.
+- `action.yml`: the gate as a composite action. Inputs reach the shell through the environment,
+  never interpolated into the script.
+- `examples/ci_gate/`: offline fixtures (PASS / FAIL / INCONCLUSIVE).
+
+### Security
+- Dependency floors raised to the lowest versions with no known advisory (`cryptography>=50.0.0`,
+  `pydantic>=2.4.0`, `requests>=2.33.0` / `urllib3>=2.8.0` on Python >= 3.10). The previous floors
+  admitted 44 known advisories. On Python 3.9 the newest `requests` and `urllib3` still carry
+  advisories fixed only for Python >= 3.10; see SECURITY.md.
+- `HBEvalClient._post` always sends a timeout (a caller that forgets one can no longer hang the agent).
+- A fault-evidence record that fails to write is now logged instead of vanishing silently.
+
+### Fixed
+- `hb-eval gate` no longer demands `--agent` and `--task` when `--reference-baseline` and
+  `--candidate-baseline` are given; the legacy path still requires them (exit 2).
+
+### Quality
+- Tests: 756 → **1,141**. Coverage 76% → **95%** (CI fails below 90%). `client.py` 35% → 93%; `mcp_server.py` 0% → covered;
+  `gate.py`, `monitoring.py`, `auto.py`, `otel_bridge.py`, the three framework adapters and the CLI are now tested.
+- Property-based fuzzing (Hypothesis) of every input parser. Its first run found a crash (`policies=True`).
+- Static typing: `py.typed` ships; `mypy` is clean on the whole package under both supported `mcp` majors; implicit-Optional
+  annotations fixed. Public API docstrings: 60% → **100%** (404 of 404).
+- The user guide's code is executed by the test suite. `examples/lifecycle.py` runs the whole V2 chain offline.
+- `docs/`: `USER_GUIDE.md`, `API_STABILITY.md`, `THREAT_MODEL.md`, `PERFORMANCE.md`, `protocol_vectors.json`.
+
+### Fixed (found while testing)
+- **MCP server**: `retrieve_qualified_memory` failed on every successful call (a pydantic object was passed to `json.dumps`).
+  And `pip install hb-eval-sdk[mcp]` resolved to `mcp` 2.x, where `FastMCP` no longer exists, so the server could not
+  start and blamed a package that was installed. Both major versions are now supported and tested.
+- **LangChain**: `HBEvalLangChainCallback` raised `AttributeError` inside the user's own run (it was not a valid handler).
+  List-style message content was stringified as a Python repr. LangGraph answered with the last message even when it was a
+  tool message; it now answers with the last AI message.
+- **Client**: `max_retries=0` was silently replaced by the default; a negative per-call retry count made `evaluate()` return
+  `None` (a gate failing open); an empty gateway URL silently redirected traffic to the default Gateway.
+- **Gate**: failure text was written into GitHub workflow commands unescaped (a newline could inject another command);
+  a non-numeric metric from the Gateway raised an exception and exited 1, the code for "the gate failed".
+- **Policies**: a mistyped rule was dropped with no trace, though the docstring promised it would be reported; a non-list
+  `policies` argument raised `TypeError`. Dropped rules are now logged and listed in the session summary with the reason.
+- **`auto`**: malformed credentials in the environment raised at import, contradicting its promise that importing it cannot
+  stop an application. **Demo CLI**: `--connect` with bad credentials crashed with a traceback and printed a retired metric name.
+- **OpenTelemetry bridge**: failures to open a session were logged at DEBUG, so a run could silently go unmonitored.
+- **`lineage.trace`** raised `AttributeError`/`StopIteration` on a corrupted lineage; it now raises `LineageError`.
+
+- **`evaluate()` crashed on the Gateway's most common answer.** For an agent evaluated without fault injection the Gateway
+  returns `INSUFFICIENT_DATA` (FRR, IRS and TI cannot be measured when nothing failed), and the SDK's `Verdict` enum only knew
+  `SAFE` and `UNSAFE`, so the typed API raised "unexpected error". Found by running the real client against the real Gateway.
+  `Verdict.INSUFFICIENT_DATA` is added (never SAFE), and `EvaluationResult` now keeps `qualified`, `tier_status`,
+  `tier_provisional` and `unmeasured_metrics`, which were silently dropped.
+
+### Changed
+- **Security**: the gateway URL must be `https` unless it is loopback or `allow_insecure_http=True` is passed, because every
+  request carries the API key. `HBEVAL_GATEWAY_URL` is honoured when no URL is given.
+- Framework integrations and the V2 submodules are **lazy** (PEP 562): `import hb_eval_sdk` no longer imports LangChain,
+  LangGraph or CrewAI. A change to a callback base class had made it load LangChain eagerly (~200 ms).
+- Optional-dependency floors raised to advisory-free versions: `langchain-core>=1.3.3` (`>=0.3.85` on 3.9), `langgraph>=1.2.14`
+  (`>=0.3.15` on 3.9), `mcp>=1.30.0,<3`. At their previous floors they admitted 29 known advisories.
+- `pytest` now works from a fresh checkout with no environment set up (`conftest.py`).
+
+### Added — release hygiene
+- `LICENSE`, `SECURITY.md`, `CONTRIBUTING.md`; `tests/__init__.py`;
+  `tests/fault_injection/conformance.py` (rewritten — see its docstring).
+
+### Unchanged
+- Battery fingerprint `ce481b32763df1ca`; `SCORING_VERSION` `v3`.
+- `MEASUREMENT_PROTOCOL_VERSION` stays `2.7.0`: no metric computation changed.
+
+### Testing
+```bash
+HBEVAL_ALLOW_FAULT_INJECTION=true PYTHONPATH=hb_eval_sdk:. pytest tests    # 1141 passed
+```
+
+---
+
+## [2.12.0] — 2026-09-17
+
+### Added — the evidence chain
+
+Until this release the SDK measured reliability and reported numbers. It had
+no way to say what a number rested on, whether two numbers could be compared
+at all, or whether a conclusion drawn a week ago still applied.
+
+This release adds eight layers between a measurement and an operational
+conclusion. Each has a state meaning **"I cannot say"**, and none of those
+states collapses into a positive or a negative answer.
+
+```
+Evidence  ->  Baseline  ->  Comparability  ->  Diff  ->  Decision
+          ->  Attestation  ->  Context assessment  ->  Durable evidence
+```
+
+#### Evidence and provenance — `evidence_package`
+
+Each metric carries typed references to the evidence it was computed from,
+separated into numerator, denominator and supporting references. A metric
+whose evidence was expected and did not arrive is `missing`, and a `missing`
+metric **cannot become a baseline**. Provenance is a gate here, not an audit
+trail: a number without its inputs does not enter the pipeline.
+
+An envelope serialises and reconstructs with its canonical hash preserved.
+
+#### Baseline and comparability — `baseline`, `comparability`
+
+```python
+from hb_eval_sdk.baseline import ReliabilityBaseline
+from hb_eval_sdk.comparability import compare
+
+baseline = ReliabilityBaseline.from_envelope(envelope)
+verdict = compare(baseline_a, baseline_b, identity_a, identity_b)
+# COMPARABLE | NOT_COMPARABLE | UNKNOWN
+```
+
+Two evaluations are compared only when the measurement context permits it,
+decided per metric and for the pair. `UNKNOWN` exists because a baseline
+stores its evaluation context as an opaque hash: when the hashes differ and
+the identities were not supplied, the reason is genuinely unavailable, and
+`NOT_COMPARABLE` would claim more than is known.
+
+#### Differences and decisions — `reliability_diff`, `reliability_decision`
+
+```python
+from hb_eval_sdk.reliability_diff import diff_baselines
+from hb_eval_sdk.reliability_decision import decide, SLOPolicy, SLOCondition
+
+policy = SLOPolicy("org-v1", (SLOCondition("frr", "gte", 0.80),))
+decision = decide(diff_baselines(baseline_a, baseline_b), policy)
+# PASS | FAIL | INCONCLUSIVE | RECERTIFICATION_REQUIRED
+```
+
+`delta` is `None` where no comparison was made — never `0.0`, which means the
+values were equal and is a measurement.
+
+**SLO thresholds are organizational policy.** There is no default policy, no
+default threshold and no default tolerance in this SDK. Without a declared
+policy the verdict is `INCONCLUSIVE`: the absence of a threshold is not
+permission.
+
+#### Bounded attestation — `attestation`
+
+```python
+from hb_eval_sdk.attestation import attest
+statement = attest(decision, subject_baseline)   # PASS decisions only
+```
+
+An attestation states that a subject reached a `PASS` decision, under a
+declared policy, on identified evidence, within a stated scope. Its
+limitations travel inside the artefact.
+
+#### Context assessment — `context_assessment`
+
+```python
+from hb_eval_sdk.context_assessment import assess_context
+result = assess_context(attestation, current_context)
+# CONTEXT_UNCHANGED | RECERTIFICATION_REQUIRED | UNDETERMINED
+```
+
+`CONTEXT_UNCHANGED` means no change was detected in the context that was
+supplied and compared. It is **not** a statement that the agent did not
+change, and **not** a statement that the attestation is still valid.
+
+New evidence does not invalidate a context: an attestation says a decision
+was reached *on this evidence*, and that stays true when newer evidence
+appears.
+
+#### Evidence persistence — `evidence_store`
+
+```python
+from hb_eval_sdk.evidence_store import store_evidence, load_evidence
+store_evidence(envelope, "evidence/run-42.json")
+restored = load_evidence("evidence/run-42.json")   # raises on any alteration
+```
+
+Atomic write, and a reload that verifies the payload bytes, the
+reconstruction, and the canonical hash against an independently recorded one.
+Any tamper raises; no failure path returns an artefact.
+
+### Changed
+
+- **`gate` no longer computes a regression by raw subtraction.** Previously
+  `hb-eval gate --baseline` subtracted two metric dictionaries and failed the
+  build on the result, with no check of comparability, metric version,
+  provenance or battery identity. It now reports the numbers as an
+  observation and makes no reliability claim from them.
+- **Two new exit codes**, `3` (`INCONCLUSIVE`) and `4`
+  (`RECERTIFICATION_REQUIRED`). `0`, `1` and `2` keep their published
+  meanings exactly.
+- **New gate flags** `--reference-baseline`, `--candidate-baseline` and
+  `--slo-policy` enable the evidence-gated decision path. `--baseline` is
+  unchanged and remains the legacy raw-report input.
+- `METRIC_NAMES["irs"]` corrected to **Intentional Recovery Score**.
+
+### Limits of this release — read before relying on it
+
+- **An attestation is not a certification.** There is no issuing authority,
+  no signature, no external anchor and no revocation. It is tamper-evident
+  within the producing process only.
+- **Evidence persistence is not provenance.** The store detects
+  *alteration*; it does not establish *authorship*. Anyone who can rewrite a
+  stored container can recompute every digest it holds and the substitution
+  verifies. Closing that needs a signature and an external anchor, neither of
+  which ships here.
+- **Persistence is not yet a durable evidence system.** There is no retention
+  policy, no storage backend, no indexing or retrieval, no backup, no
+  cross-host concurrency and no garbage collection. Evidence survives a
+  process; that is less than being durably stored.
+- **`CONTEXT_UNCHANGED` is bounded by what was declared.** The current
+  context comes from the caller, not from runtime observation, and sampling
+  parameters sit outside the configuration fingerprint — so it means
+  unchanged *under the represented configuration identity*, not proof that
+  every runtime parameter held.
+- **IRS remains provisional.** No judge has been validated, and a provisional
+  metric drives a decision only when a policy declares it eligible.
+- **Scope is one battery slot.** An attestation covers the slot it was issued
+  for and says nothing about an agent as a whole.
+- **No causal attribution and no reproducible-regression claim.** A
+  difference is reported, never explained.
+- **All results to date are from synthetic SDK executions.** No real-agent
+  empirical validation ships with this release.
+
+### Verification
+
+```
+417 tests passing
+Phase 0 regression baseline byte-identical across all eight phases
+battery_spec_fingerprint unchanged: ce481b32763df1ca
+evidence schema frozen: hb-eval-evidence/v1
+```
+
+The frozen evidence schema is versioned separately from the storage container
+format (`hb-eval-container/v2`), so a storage change cannot move an
+artefact's identity.
+
+---
+
 ## [2.11.0] — 2026-08-26
 
 ### Added — real runtime fault injection

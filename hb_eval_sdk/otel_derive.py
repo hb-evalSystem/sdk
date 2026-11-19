@@ -158,15 +158,19 @@ class SpanRecord:
         return ""
 
     def is_tool_call(self) -> bool:
+        """True if the span is a GenAI `execute_tool` operation."""
         return self.operation() == OP_EXECUTE_TOOL
 
     def is_model_call(self) -> bool:
+        """True if the span is a GenAI `chat` operation."""
         return self.operation() == OP_CHAT
 
     def is_agent_root(self) -> bool:
+        """True if the span has no parent, or is an `invoke_agent` or workflow operation: the span whose end closes a monitoring session."""
         return self.is_root or self.operation() in (OP_INVOKE_AGENT, OP_WORKFLOW)
 
     def tool_name(self) -> str:
+        """The tool's name from the `gen_ai.tool.name` attribute, falling back to the span name (`execute_tool search` gives `search`)."""
         name = self.attributes.get(ATTR_TOOL_NAME)
         if name:
             return str(name)
@@ -181,6 +185,7 @@ class SpanRecord:
 
     # ── Fault detection ─────────────────────────────────────────────────────
     def has_exception(self) -> bool:
+        """True if the span recorded an exception event."""
         return any(
             str(e.get("name", "")).lower() == "exception" for e in self.events
         )
@@ -374,6 +379,7 @@ class StepDeriver:
 
     @property
     def step_count(self) -> int:
+        """How many steps have been derived so far."""
         return self._steps
 
 

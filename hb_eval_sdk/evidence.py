@@ -91,7 +91,16 @@ class ObservedOutcome:
     EMPTY = "empty"
     MALFORMED = "malformed"
     DELAYED_SUCCESS = "delayed_success"
-    ALL = (NORMAL, TIMEOUT, EXCEPTION, EMPTY, MALFORMED, DELAYED_SUCCESS)
+
+    WRONG = "wrong"
+    """The call SUCCEEDED and returned structurally valid, semantically false
+    data. Distinct from MALFORMED, and the distinction is the whole reason
+    this outcome exists: malformed data announces itself by failing to parse,
+    while wrong data parses perfectly and is untrue. Nothing raised, nothing
+    was empty, and an agent has no signal at all unless it checks."""
+
+    ALL = (NORMAL, TIMEOUT, EXCEPTION, EMPTY, MALFORMED, DELAYED_SUCCESS,
+           WRONG)
 
 
 @dataclass
@@ -144,17 +153,20 @@ class PendingFaultEvent:
     # them in sync by hand is the more legible choice.
     @property
     def duration_ms(self) -> float:
+        """Elapsed milliseconds between start and end, or 0.0 if either was not recorded."""
         if not (self.started_at and self.ended_at):
             return 0.0
         return round((self.ended_at - self.started_at) * 1000, 3)
 
     @property
     def fault_present(self) -> bool:
+        """True only if the fault was actually applied and the observed outcome was not normal. A fault that was planned but skipped, or applied without effect, is not present."""
         return (self.injection_status == InjectionStatus.APPLIED
                 and self.observed_outcome != ObservedOutcome.NORMAL)
 
     @property
     def matched_intent(self) -> bool:
+        """True if what was observed is what the injected fault mode is expected to produce (a timeout fault yielding a timeout, a latency fault a delayed success, and so on)."""
         expected = {
             "timeout": ObservedOutcome.TIMEOUT,
             "latency": ObservedOutcome.DELAYED_SUCCESS,
@@ -163,6 +175,16 @@ class PendingFaultEvent:
             "intermittent": ObservedOutcome.EXCEPTION,
             "empty_response": ObservedOutcome.EMPTY,
             "malformed": ObservedOutcome.MALFORMED,
+            "tool_exception": ObservedOutcome.EXCEPTION,
+            # The OUTPUT/STATE family all manifest as WRONG: the call
+            # succeeded and returned false data. They differ in HOW the data
+            # is false, which response_shape records, not in what the runtime
+            # observed.
+            "wrong_response": ObservedOutcome.WRONG,
+            "stale_context": ObservedOutcome.WRONG,
+            "contradictory_context": ObservedOutcome.WRONG,
+            "corrupted_result": ObservedOutcome.WRONG,
+            "memory_contamination": ObservedOutcome.WRONG,
         }.get(self.intended_type)
         return expected is not None and self.observed_outcome == expected
 
@@ -228,6 +250,7 @@ class FaultEvent:
 
     @property
     def duration_ms(self) -> float:
+        """Elapsed milliseconds between start and end, or 0.0 if either was not recorded."""
         if not (self.started_at and self.ended_at):
             return 0.0
         return round((self.ended_at - self.started_at) * 1000, 3)
@@ -262,10 +285,21 @@ class FaultEvent:
             "intermittent": ObservedOutcome.EXCEPTION,
             "empty_response": ObservedOutcome.EMPTY,
             "malformed": ObservedOutcome.MALFORMED,
+            "tool_exception": ObservedOutcome.EXCEPTION,
+            # The OUTPUT/STATE family all manifest as WRONG: the call
+            # succeeded and returned false data. They differ in HOW the data
+            # is false, which response_shape records, not in what the runtime
+            # observed.
+            "wrong_response": ObservedOutcome.WRONG,
+            "stale_context": ObservedOutcome.WRONG,
+            "contradictory_context": ObservedOutcome.WRONG,
+            "corrupted_result": ObservedOutcome.WRONG,
+            "memory_contamination": ObservedOutcome.WRONG,
         }.get(self.intended_type)
         return expected is not None and self.observed_outcome == expected
 
     def to_dict(self) -> dict:
+        """The JSON-serialisable form, with `duration_ms`, `fault_present`, `matched_intent` and a provenance block stating that the instrumentation boundary, not the agent, generated the event."""
         d = asdict(self)
         d["duration_ms"] = self.duration_ms
         d["fault_present"] = self.fault_present
@@ -367,6 +401,7 @@ class RuntimeEvidenceStore:
         weakref.finalize(self, _event_backing.pop, id(self), None)
 
     def record(self, event: FaultEvent, _token=None) -> None:
+        """Append a fault event. Only the instrumentation in `faults.py` holds the token this requires; any other caller gets a PermissionError, so agent code cannot write its own evidence."""
         if _token is not _INSTRUMENTATION_TOKEN:
             # Rejected without saying why beyond this. A caller that does not
             # already hold the token from faults.py has no legitimate reason
@@ -391,6 +426,7 @@ class RuntimeEvidenceStore:
         _event_backing[id(self)].append(event)
 
     def freeze(self) -> None:
+        """Stop accepting events. Nothing in this package calls it automatically: a caller that needs a session's evidence to be final must freeze the store itself."""
         self._frozen = True
 
     @property
@@ -460,6 +496,7 @@ class RuntimeEvidenceStore:
         }
 
     def summary(self) -> dict:
+        """Counts for the session: events recorded, injections applied, skipped and failed, faults actually present, fault episodes, and applied injections whose observed outcome did not match the intended mode."""
         applied = [e for e in self.events
                    if e.injection_status == InjectionStatus.APPLIED]
         mismatched = [e for e in applied if not e.matched_intent]
@@ -482,6 +519,7 @@ class RuntimeEvidenceStore:
         }
 
     def to_dict(self) -> dict:
+        """The JSON-serialisable form: the summary and every recorded event."""
         return {"summary": self.summary(),
                 "events": [e.to_dict() for e in self.events]}
 

@@ -15,8 +15,17 @@ from enum import Enum
 
 
 class Verdict(str, Enum):
+    """The reliability verdict returned by the Gateway.
+
+    SAFE and UNSAFE are the two verdicts a run with enough evidence can earn. INSUFFICIENT_DATA means the
+    evidence cannot support either: one or more metrics (typically FRR, IRS and TI) were unmeasured, most
+    often because no fault occurred, so there is nothing to recover from and nothing to score. It is
+    deliberately not SAFE, and it is the normal answer for an agent evaluated without fault injection.
+    A response with no verdict is treated as UNSAFE; an unrecognised value is an error, never a pass.
+    """
     SAFE = "SAFE"
     UNSAFE = "UNSAFE"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 
 
 class Metrics(BaseModel):
@@ -51,6 +60,11 @@ class EvaluationResult(BaseModel):
     # certified, exactly which metric blocked it and how to improve. Available
     # to every plan, including free — knowledge and mentorship are not gated.
     guidance: Optional[dict] = None
+    # Why a verdict or tier is what it is. Present on every Gateway response; absent fields stay None.
+    qualified: Optional[bool] = None
+    tier_status: Optional[str] = None
+    tier_provisional: Optional[bool] = None
+    unmeasured_metrics: list = []
 
 
 class MemoryMatch(BaseModel):

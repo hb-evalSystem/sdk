@@ -45,3 +45,7 @@ class SafeHaltError(HBEvalError):
     def __init__(self, message: str, reason: str = "CONNECTION_LOST_MANDATORY_HALT"):
         super().__init__(message)
         self.reason = reason
+
+
+class ProtocolMismatchWarning(UserWarning):
+    """The Gateway advertises a wire-protocol version this SDK does not share (major.minor)."""

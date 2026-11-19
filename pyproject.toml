@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hb-eval-sdk"
-version = "2.11.0"
+version = "2.13.0"
 description = "HB-Eval SDK: operational reliability evaluation for agentic AI — fault-injection battery, runtime monitoring, MCP server, and LangChain/LangGraph/CrewAI adapters"
 authors = [{name = "Abuelgasim Mohamed Ibrahim Adam", email = "abuelgasim.hbeval@outlook.com"}]
 license = {text = "MIT"}
@@ -21,10 +21,18 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Floors are the LOWEST versions with no known advisory (pip-audit, checked at release),
+# not the lowest that merely work: a library that allows a vulnerable install
+# makes its users' environments vulnerable. On Python 3.9 the newest requests (2.32.5)
+# and urllib3 (2.6.3) still carry advisories whose fixes require Python >= 3.10, so
+# 3.9 gets the best available and the residual is stated in SECURITY.md.
 dependencies = [
-    "requests>=2.28.0",
-    "cryptography>=41.0.0",
-    "pydantic>=2.0.0",
+    "requests>=2.33.0; python_version >= '3.10'",
+    "requests>=2.32.5; python_version < '3.10'",
+    "urllib3>=2.8.0; python_version >= '3.10'",
+    "cryptography>=50.0.0",
+    "pydantic>=2.4.0; python_version < '3.13'",
+    "pydantic>=2.9.0; python_version >= '3.13'",
 ]
 
 # Optional extras. The core SDK (evaluation, battery, memory, runtime
@@ -37,17 +45,19 @@ dependencies = [
 # installing it to monitor an agent must never drag a telemetry stack into
 # that agent's environment unless the user asks for it.
 otel = ["opentelemetry-api>=1.30.0", "opentelemetry-sdk>=1.30.0"]
-langchain = ["langchain-core>=0.1.0"]
-langgraph = ["langgraph>=0.2.0", "langchain-core>=0.1.0"]
+langchain = ["langchain-core>=1.3.3; python_version >= '3.10'", "langchain-core>=0.3.85; python_version < '3.10'"]
+langgraph = ["langgraph>=1.2.14; python_version >= '3.10'", "langgraph>=0.3.15; python_version < '3.10'", "langchain-core>=1.3.3; python_version >= '3.10'", "langchain-core>=0.3.85; python_version < '3.10'"]
 crewai = ["crewai>=0.28.0"]
-mcp = ["mcp>=1.2.0"]
+mcp = ["mcp>=1.30.0,<3"]
 all-integrations = [
-    "langchain-core>=0.1.0",
-    "langgraph>=0.2.0",
+    "langchain-core>=1.3.3; python_version >= '3.10'",
+    "langchain-core>=0.3.85; python_version < '3.10'",
+    "langgraph>=1.2.14; python_version >= '3.10'",
+    "langgraph>=0.3.15; python_version < '3.10'",
     "crewai>=0.28.0",
-    "mcp>=1.2.0",
+    "mcp>=1.30.0,<3",
 ]
-dev = ["pytest>=7.0.0", "flake8>=6.0.0"]
+dev = ["pytest>=7.0.0", "flake8>=6.0.0", "hypothesis>=6.0.0", "coverage>=7.0.0", "mypy>=1.0.0"]
 
 # Entry point for the MCP server, so it can be launched as `hbeval-mcp` in
 # addition to `python -m hb_eval_sdk.mcp_server`. Some MCP clients are easier
@@ -60,7 +70,7 @@ hb-eval = "hb_eval_sdk.demo:main"
 
 [project.urls]
 Homepage = "https://hbeval.com"
-Repository = "https://github.com/hb-evalSystem/hb-eval-sdk"
+Repository = "https://github.com/hb-evalSystem/sdk"
 Documentation = "https://github.com/hb-evalSystem/HB-System/blob/main/docs"
 
 [tool.pytest.ini_options]
@@ -69,3 +79,22 @@ Documentation = "https://github.com/hb-evalSystem/HB-System/blob/main/docs"
 # file, keeps `pytest tests/fault_injection/` — the command the conformance
 # procedure specifies — working literally as written.
 python_files = ["test_*.py", "conformance.py"]
+
+[tool.setuptools]
+# Declared explicitly rather than auto-discovered. Adding experiments/ at the
+# repository root — which the v2.0 specification requires — made setuptools
+# flat-layout discovery fail with "Multiple top-level packages discovered",
+# breaking `pip install .` entirely. Naming the package removes the ambiguity
+# and keeps experiment artefacts out of the distributed wheel, where they do
+# not belong.
+packages = ["hb_eval_sdk"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+check_untyped_defs = false
+no_implicit_optional = true
+warn_redundant_casts = true
+
+[tool.setuptools.package-data]
+hb_eval_sdk = ["py.typed"]

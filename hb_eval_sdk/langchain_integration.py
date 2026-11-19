@@ -42,6 +42,8 @@ Usage
 from __future__ import annotations
 from typing import Any, Callable, Optional
 
+from ._adapters import content_to_text
+
 
 def adapt_langchain_agent(
     agent_executor: Any,
@@ -85,7 +87,7 @@ def adapt_langchain_agent(
             return str(raw)
         content = getattr(raw, "content", None)
         if content is not None:
-            return str(content)
+            return content_to_text(content)
         return str(raw)
 
     def agent_runner(system_prompt: str, question: str) -> str:
@@ -101,8 +103,18 @@ def adapt_langchain_agent(
     return agent_runner
 
 
-class HBEvalLangChainCallback:
+try:                                    # a real LangChain handler when LangChain is installed
+    from langchain_core.callbacks import BaseCallbackHandler as _CallbackBase
+except ImportError:                     # the adapter itself needs no LangChain import
+    _CallbackBase = object  # type: ignore[assignment,misc]
+
+
+class HBEvalLangChainCallback(_CallbackBase):  # type: ignore[misc, valid-type]
     """Optional passive callback for LangChain's callback system.
+
+    Subclasses LangChain's BaseCallbackHandler. A plain object is not a valid handler: LangChain
+    reads attributes such as `raise_error` and `ignore_agent` from every handler, so a duck-typed
+    class raised AttributeError inside the user's own run the first time a tool was called.
 
     This does NOT run the battery itself — it collects per-run diagnostics
     (tool calls, retries, errors) alongside a battery run driven by
@@ -116,11 +128,15 @@ class HBEvalLangChainCallback:
         self.errors: list = []
 
     def on_tool_start(self, serialized: dict, input_str: str, **kwargs: Any) -> None:
-        self.tool_calls.append({"tool": serialized.get("name"), "input": input_str})
+        # LangChain passes `serialized=None` for many tool invocations.
+        """Record a tool invocation. LangChain often passes `serialized=None`, in which case the name falls back to the `name` keyword argument."""
+        self.tool_calls.append({"tool": (serialized or {}).get("name") or kwargs.get("name"), "input": input_str})
 
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
+        """Record the message of a tool error."""
         self.errors.append(str(error))
 
     def reset(self) -> None:
+        """Clear the recorded tool calls and errors."""
         self.tool_calls.clear()
         self.errors.clear()

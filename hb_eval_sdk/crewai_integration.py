@@ -58,7 +58,12 @@ def adapt_crewai_agent(
     Returns:
         A callable (system_prompt, question) -> str.
     """
-    from crewai import Task, Crew
+    try:
+        from crewai import Task, Crew
+    except ImportError as exc:
+        raise ImportError(
+            "adapt_crewai_agent needs CrewAI. Install it with: pip install crewai"
+        ) from exc
 
     def agent_runner(system_prompt: str, question: str) -> str:
         task = Task(
@@ -136,6 +141,7 @@ class HBEvalCrewObserver:
         self.task_log: list = []
 
     def record(self, task_description: str, agent_role: str, output: Any) -> None:
+        """Record one finished CrewAI task: its description, the agent role that ran it, and the extracted text of its output."""
         self.task_log.append({
             "task": task_description,
             "agent": agent_role,
@@ -143,4 +149,5 @@ class HBEvalCrewObserver:
         })
 
     def reset(self) -> None:
+        """Clear the recorded task log."""
         self.task_log.clear()
